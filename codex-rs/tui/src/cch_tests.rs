@@ -61,6 +61,38 @@ fn history_snapshot_digest_binds_revision_prelude_and_high_water() {
 }
 
 #[test]
+fn native_protocol_admission_is_exact_and_atomic() {
+    let contract = |admission: serde_json::Value| {
+        let mut value = serde_json::json!({
+            "contractSha256": CONTRACT_SHA256,
+            "namespaceCanonicalJson": "namespace"
+        });
+        value
+            .as_object_mut()
+            .expect("contract object")
+            .extend(admission.as_object().expect("admission object").clone());
+        serde_json::from_value::<ContractResponse>(value).expect("contract response")
+    };
+
+    assert!(!valid_native_protocol(&contract(serde_json::json!({}))));
+    assert!(valid_native_protocol(&contract(serde_json::json!({
+        "nativeCapability": NATIVE_CAPABILITY,
+        "nativeProtocolSha256": NATIVE_PROTOCOL_SHA256,
+        "nativeProtocolVersion": NATIVE_PROTOCOL_VERSION,
+    }))));
+    for admission in [
+        serde_json::json!({"nativeProtocolVersion": NATIVE_PROTOCOL_VERSION}),
+        serde_json::json!({
+            "nativeCapability": NATIVE_CAPABILITY,
+            "nativeProtocolSha256": "0".repeat(64),
+            "nativeProtocolVersion": NATIVE_PROTOCOL_VERSION,
+        }),
+    ] {
+        assert!(!valid_native_protocol(&contract(admission)));
+    }
+}
+
+#[test]
 fn bearer_token_validation_matches_cch_contract_and_redacts_secrets() {
     let missing = CchTransport::new(endpoint("http://127.0.0.1:1/"), |_| {
         Err(std::env::VarError::NotPresent)
@@ -90,12 +122,13 @@ fn bearer_token_validation_matches_cch_contract_and_redacts_secrets() {
 }
 
 #[tokio::test]
-async fn bearer_token_is_attached_to_every_get_and_post() {
+async fn bearer_and_native_capability_are_attached_to_contract_get() {
     let server = MockServer::start().await;
     let token = "01234567abcdefghijklmnopqrstuvwxyz=";
     Mock::given(method("GET"))
         .and(path("/v1/runtime/contract"))
         .and(header("authorization", format!("Bearer {token}")))
+        .and(header(NATIVE_CAPABILITY_HEADER, NATIVE_CAPABILITY))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
         .expect(1)
         .mount(&server)

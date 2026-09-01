@@ -45,6 +45,12 @@ impl StrictHistorySnapshot {
 }
 pub(crate) const CONTRACT_SHA256: &str =
     "40f1d07cf785ec0e057f1e5fd449cf91e9762396c09aeb4bb3a22fa7a104ebf8";
+pub(crate) const NATIVE_PROTOCOL_VERSION: &str = "cch.codex-native-http.v1";
+pub(crate) const NATIVE_PROTOCOL_SHA256: &str =
+    "3e30c9d59276b786dd61ff16b044ac205ccb58b92e7e316341ec4cb658959663";
+pub(crate) const NATIVE_CAPABILITY: &str =
+    "cch-native/3e30c9d59276b786dd61ff16b044ac205ccb58b92e7e316341ec4cb658959663";
+const NATIVE_CAPABILITY_HEADER: &str = "x-cch-native-capability";
 const MIN_BEARER_TOKEN_CORE_BYTES: usize = 32;
 const MIN_BEARER_TOKEN_DISTINCT_CORE_BYTES: usize = 8;
 const MAX_BEARER_TOKEN_BYTES: usize = 4 * 1024;
@@ -114,6 +120,7 @@ impl CchTransport {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Response, CchError> {
+        let advertise_native = body.is_none() && path == "v1/runtime/contract";
         let url = self
             .endpoint
             .base_url
@@ -129,6 +136,11 @@ impl CchTransport {
         }
         .bearer_auth(&self.bearer_token)
         .timeout(self.endpoint.timeout);
+        let request = if advertise_native {
+            request.header(NATIVE_CAPABILITY_HEADER, NATIVE_CAPABILITY)
+        } else {
+            request
+        };
         let mut response = request.send().await.map_err(|_| CchError::RequestFailed)?;
         if !response.status().is_success() {
             return Err(CchError::RequestRejected(response.status().as_u16()));
@@ -185,6 +197,12 @@ pub(crate) struct CchIntegration {
 struct ContractResponse {
     contract_sha256: String,
     namespace_canonical_json: String,
+    #[serde(default)]
+    native_capability: Option<String>,
+    #[serde(default)]
+    native_protocol_sha256: Option<String>,
+    #[serde(default)]
+    native_protocol_version: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -225,7 +243,10 @@ impl CchIntegration {
             "{:x}",
             Sha256::digest(contract.namespace_canonical_json.as_bytes())
         );
-        if contract.contract_sha256 != CONTRACT_SHA256 || digest != CONTRACT_SHA256 {
+        if contract.contract_sha256 != CONTRACT_SHA256
+            || digest != CONTRACT_SHA256
+            || !valid_native_protocol(&contract)
+        {
             return Err(CchError::ContractMismatch);
         }
         Ok(Some(Self {
@@ -347,6 +368,20 @@ impl CchIntegration {
         } else {
             Err(CchError::InvalidResponse)
         }
+    }
+}
+fn valid_native_protocol(contract: &ContractResponse) -> bool {
+    match (
+        contract.native_protocol_version.as_deref(),
+        contract.native_protocol_sha256.as_deref(),
+        contract.native_capability.as_deref(),
+    ) {
+        (Some(version), Some(protocol), Some(capability)) => {
+            version == NATIVE_PROTOCOL_VERSION
+                && protocol == NATIVE_PROTOCOL_SHA256
+                && capability == NATIVE_CAPABILITY
+        }
+        _ => false,
     }
 }
 pub(crate) async fn fetch_strict_history_revision(
