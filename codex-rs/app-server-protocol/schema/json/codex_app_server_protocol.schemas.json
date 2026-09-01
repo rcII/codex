@@ -21452,6 +21452,45 @@
         ],
         "type": "object"
       },
+      "ThreadItemHistoryEntry": {
+        "properties": {
+          "completedAtMs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "historyRevision": {
+            "type": "string"
+          },
+          "item": {
+            "$ref": "#/definitions/v2/ThreadItem"
+          },
+          "sourceOrdinal": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceSubordinal": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "turnId": {
+            "description": "Turn containing this item.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "historyRevision",
+          "item",
+          "sourceOrdinal",
+          "sourceSubordinal",
+          "turnId"
+        ],
+        "type": "object"
+      },
       "ThreadItemsListParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -23648,6 +23687,90 @@
           "turnId"
         ],
         "title": "ThreadTokenUsageUpdatedNotification",
+        "type": "object"
+      },
+      "ThreadTurnHistoryEntry": {
+        "properties": {
+          "completedAt": {
+            "description": "Unix timestamp (in seconds) when the turn completed.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "durationMs": {
+            "description": "Duration between turn start and completion in milliseconds, if known.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only populated when the Turn's status is failed."
+          },
+          "historyRevision": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Identifier for this turn. Codex-generated turn IDs are UUIDv7.",
+            "type": "string"
+          },
+          "items": {
+            "description": "Thread items currently included in this turn payload.",
+            "items": {
+              "$ref": "#/definitions/v2/ThreadItem"
+            },
+            "type": "array"
+          },
+          "itemsView": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/TurnItemsView"
+              }
+            ],
+            "default": "full",
+            "description": "Describes how much of `items` has been loaded for this turn."
+          },
+          "sourceOrdinal": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sourceSubordinal": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "startedAt": {
+            "description": "Unix timestamp (in seconds) when the turn started.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/definitions/v2/TurnStatus"
+          }
+        },
+        "required": [
+          "historyRevision",
+          "id",
+          "items",
+          "sourceOrdinal",
+          "sourceSubordinal",
+          "status"
+        ],
         "type": "object"
       },
       "ThreadTurnsListParams": {

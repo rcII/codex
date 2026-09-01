@@ -51,6 +51,7 @@ pub(super) struct RolloutHistoryPosition {
 
 pub(super) struct StoredTurnRow {
     pub position: RolloutHistoryPosition,
+    pub source_ordinal: u64,
     pub turn_id: String,
     pub status: StoredTurnStatus,
     pub error: Option<StoredTurnError>,
@@ -69,12 +70,14 @@ pub(super) struct StoredSummaryColumns {
     summary_first_user_rollout_ordinal: Option<i64>,
     summary_first_user_updated_at_ordinal: Option<i64>,
     summary_first_user_created_at_ms: Option<i64>,
+    summary_first_user_completed_at_ms: Option<i64>,
     summary_first_user_item_json: Option<String>,
     summary_final_agent_turn_id: Option<String>,
     summary_final_agent_item_id: Option<String>,
     summary_final_agent_rollout_ordinal: Option<i64>,
     summary_final_agent_updated_at_ordinal: Option<i64>,
     summary_final_agent_created_at_ms: Option<i64>,
+    summary_final_agent_completed_at_ms: Option<i64>,
     summary_final_agent_item_json: Option<String>,
 }
 
@@ -84,6 +87,7 @@ struct StoredSummaryItemColumns {
     rollout_ordinal: Option<i64>,
     updated_at_ordinal: Option<i64>,
     created_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
     item_json: Option<String>,
 }
 
@@ -133,6 +137,7 @@ pub(in crate::local) async fn list_turns(
         };
         turns.push(StoredTurn {
             turn_id: turn.turn_id,
+            source_ordinal: turn.source_ordinal,
             items,
             items_view: params.items_view,
             status: turn.status,
@@ -223,7 +228,7 @@ async fn load_inherited_summary_items(
         .transpose()?;
     let rows = sqlx::query(
         r#"
-SELECT turn_id, item_id, updated_at_ordinal, created_at_ms, item_json
+SELECT turn_id, item_id, updated_at_ordinal, created_at_ms, completed_at_ms, item_json
 FROM thread_items
 WHERE thread_id = ?
   AND turn_id = ?
@@ -297,10 +302,13 @@ pub(super) fn stored_turn_row(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult
         .map(serde_json::from_str)
         .transpose()
         .map_err(super::thread_history_error)?;
+    let rollout_ordinal = row.try_get::<i64, _>("rollout_ordinal")?;
+    let source_ordinal = row
+        .try_get::<Option<i64>, _>("rollout_end_ordinal")?
+        .unwrap_or(rollout_ordinal);
     Ok(StoredTurnRow {
-        position: RolloutHistoryPosition {
-            rollout_ordinal: row.try_get("rollout_ordinal")?,
-        },
+        position: RolloutHistoryPosition { rollout_ordinal },
+        source_ordinal: stored_source_ordinal(source_ordinal, "turn")?,
         turn_id: row.try_get("turn_id")?,
         status,
         error,
@@ -322,6 +330,7 @@ impl StoredSummaryColumns {
                 rollout_ordinal: self.summary_first_user_rollout_ordinal,
                 updated_at_ordinal: self.summary_first_user_updated_at_ordinal,
                 created_at_ms: self.summary_first_user_created_at_ms,
+                completed_at_ms: self.summary_first_user_completed_at_ms,
                 item_json: self.summary_first_user_item_json,
             }
             .into_stored_item()?,
@@ -331,6 +340,7 @@ impl StoredSummaryColumns {
                 rollout_ordinal: self.summary_final_agent_rollout_ordinal,
                 updated_at_ordinal: self.summary_final_agent_updated_at_ordinal,
                 created_at_ms: self.summary_final_agent_created_at_ms,
+                completed_at_ms: self.summary_final_agent_completed_at_ms,
                 item_json: self.summary_final_agent_item_json,
             }
             .into_stored_item()?,
@@ -373,6 +383,7 @@ impl StoredSummaryItemColumns {
                 item_id,
                 updated_at_ordinal: stored_updated_at_ordinal(updated_at_ordinal)?,
                 created_at_ms,
+                completed_at_ms: self.completed_at_ms,
                 item_json: item_json.into_bytes(),
             },
         )))
@@ -401,6 +412,7 @@ fn stored_thread_item(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<StoredT
         item_id: row.try_get("item_id")?,
         updated_at_ordinal,
         created_at_ms: row.try_get("created_at_ms")?,
+        completed_at_ms: row.try_get("completed_at_ms")?,
         item_json: row.try_get::<String, _>("item_json")?.into_bytes(),
     })
 }
@@ -408,6 +420,12 @@ fn stored_thread_item(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<StoredT
 fn stored_updated_at_ordinal(updated_at_ordinal: i64) -> ThreadStoreResult<u64> {
     u64::try_from(updated_at_ordinal).map_err(|_| ThreadStoreError::Internal {
         message: format!("invalid stored item updated-at ordinal: {updated_at_ordinal}"),
+    })
+}
+
+fn stored_source_ordinal(value: i64, owner: &str) -> ThreadStoreResult<u64> {
+    u64::try_from(value).map_err(|_| ThreadStoreError::Internal {
+        message: format!("invalid stored {owner} source ordinal: {value}"),
     })
 }
 

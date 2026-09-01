@@ -3,7 +3,6 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use codex_app_server_client::AppServerRequestHandle;
-use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
@@ -496,7 +495,7 @@ async fn execute_inner(
                 ));
             }
             let thread = read_thread(&handle, &arguments.thread_id).await?;
-            let page: Result<ThreadTurnsListResponse, TypedRequestError> = handle
+            let page: ThreadTurnsListResponse = handle
                 .request_typed(ClientRequest::ThreadTurnsList {
                     request_id: RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
                     params: ThreadTurnsListParams {
@@ -507,45 +506,9 @@ async fn execute_inner(
                         items_view: Some(TurnItemsView::Full),
                     },
                 })
-                .await;
-            let (turns, next_cursor) = match page {
-                Ok(page) => (page.data, page.next_cursor),
-                Err(TypedRequestError::Server { source, .. })
-                    if crate::app_server_session::is_history_pagination_unsupported(&source) =>
-                {
-                    let response: ThreadReadResponse =
-                        request(&handle, |request_id| ClientRequest::ThreadRead {
-                            request_id,
-                            params: ThreadReadParams {
-                                thread_id: arguments.thread_id.clone(),
-                                include_turns: true,
-                            },
-                        })
-                        .await?;
-                    let end = match arguments.cursor.as_deref() {
-                        Some(cursor) => response
-                            .thread
-                            .turns
-                            .iter()
-                            .position(|turn| turn.id == cursor)
-                            .ok_or_else(|| format!("Unknown cursor: {cursor}"))?,
-                        None => response.thread.turns.len(),
-                    };
-                    let turns: Vec<Turn> = response.thread.turns[..end]
-                        .iter()
-                        .rev()
-                        .take(turn_limit as usize)
-                        .cloned()
-                        .collect();
-                    let next_cursor = if end > turns.len() {
-                        turns.last().map(|turn| turn.id.clone())
-                    } else {
-                        None
-                    };
-                    (turns, next_cursor)
-                }
-                Err(error) => return Err(error.to_string()),
-            };
+                .await
+                .map_err(|error| error.to_string())?;
+            let (turns, next_cursor) = (page.data, page.next_cursor);
             Ok(json!({
                 "schemaVersion": 1,
                 "thread": {
@@ -589,23 +552,21 @@ async fn execute_inner(
             thread_start_params.cwd = Some(source_thread.cwd.to_string_lossy().into_owned());
             thread_start_params.project_id = source_thread.project_id.clone();
             thread_start_params.ephemeral = Some(source_thread.ephemeral);
-            thread_start_params.history_mode = (source_thread.history_mode
-                == ThreadHistoryMode::Paginated)
-                .then_some(ThreadHistoryMode::Paginated);
-            let exclude_turns = source_thread.history_mode == ThreadHistoryMode::Paginated;
-            let source: ThreadResumeResponse = request_with_history_fallback(
-                &handle,
-                exclude_turns,
-                |request_id, exclude_turns| ClientRequest::ThreadResume {
+            if source_thread.history_mode != ThreadHistoryMode::Paginated {
+                return Err("background tasks require native paginated history".to_string());
+            }
+            thread_start_params.history_mode = Some(ThreadHistoryMode::Paginated);
+            let source: ThreadResumeResponse =
+                request(&handle, |request_id| ClientRequest::ThreadResume {
                     request_id,
                     params: ThreadResumeParams {
                         thread_id: params.thread_id.clone(),
-                        exclude_turns,
+                        exclude_turns: true,
+                        config: mcp_config.clone(),
                         ..ThreadResumeParams::default()
                     },
-                },
-            )
-            .await?;
+                })
+                .await?;
             thread_start_params.model = Some(source.model);
             thread_start_params.service_tier = Some(source.service_tier);
             thread_start_params.runtime_workspace_roots = Some(source.runtime_workspace_roots);
@@ -632,14 +593,13 @@ async fn execute_inner(
             if let Some(model) = arguments.model {
                 thread_start_params.model = Some(model);
             }
-            let (started, _, task_tools_available) =
-                crate::app_server_session::request_thread_start_with_history_fallback(
-                    &handle,
-                    RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
-                    thread_start_params,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            let (started, task_tools_available) = crate::app_server_session::request_thread_start(
+                &handle,
+                RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
+                thread_start_params,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             let thread_id = started.thread.id;
             register_background_thread(app_event_tx, &thread_id, task_tools_available).await?;
             if let Some(title) = arguments.title
@@ -676,7 +636,7 @@ async fn execute_inner(
             let before_turn_id = if same_thread_id(&thread_id, &params.thread_id) {
                 Some(params.turn_id)
             } else if matches!(thread.status, ThreadStatus::Active { .. }) {
-                let page: Result<ThreadTurnsListResponse, TypedRequestError> = handle
+                let page: ThreadTurnsListResponse = handle
                     .request_typed(ClientRequest::ThreadTurnsList {
                         request_id: RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4())),
                         params: ThreadTurnsListParams {
@@ -687,27 +647,9 @@ async fn execute_inner(
                             items_view: Some(TurnItemsView::NotLoaded),
                         },
                     })
-                    .await;
-                let turns = match page {
-                    Ok(page) => page.data,
-                    Err(TypedRequestError::Server { source, .. })
-                        if crate::app_server_session::is_history_pagination_unsupported(
-                            &source,
-                        ) =>
-                    {
-                        let response: ThreadReadResponse =
-                            request(&handle, |request_id| ClientRequest::ThreadRead {
-                                request_id,
-                                params: ThreadReadParams {
-                                    thread_id: thread_id.clone(),
-                                    include_turns: true,
-                                },
-                            })
-                            .await?;
-                        response.thread.turns
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let turns = page.data;
                 turns
                     .into_iter()
                     .find(|turn| turn.status == codex_app_server_protocol::TurnStatus::InProgress)
@@ -715,23 +657,19 @@ async fn execute_inner(
             } else {
                 None
             };
-            let exclude_turns = thread.history_mode == ThreadHistoryMode::Paginated;
-            let response: ThreadForkResponse = request_with_history_fallback(
-                &handle,
-                exclude_turns,
-                |request_id, exclude_turns| ClientRequest::ThreadFork {
+            let response: ThreadForkResponse =
+                request(&handle, |request_id| ClientRequest::ThreadFork {
                     request_id,
                     params: ThreadForkParams {
                         thread_id: thread_id.clone(),
                         before_turn_id: before_turn_id.clone(),
                         ephemeral: thread.ephemeral,
-                        exclude_turns,
+                        exclude_turns: true,
                         config: mcp_config.clone(),
                         ..ThreadForkParams::default()
                     },
-                },
-            )
-            .await?;
+                })
+                .await?;
             Ok(json!({
                 "environment": {"type": "same-directory"},
                 "sourceThreadId": thread_id,
@@ -747,22 +685,17 @@ async fn execute_inner(
             validate_prompt(&arguments.prompt, MAX_INPUT_BYTES)?;
             let prompt = delegated_prompt(&params.thread_id, &arguments.prompt);
             validate_prompt(&prompt, MAX_DELEGATED_INPUT_BYTES)?;
-            let thread = read_thread(&handle, &arguments.thread_id).await?;
-            let exclude_turns = thread.history_mode == ThreadHistoryMode::Paginated;
-            let _: ThreadResumeResponse = request_with_history_fallback(
-                &handle,
-                exclude_turns,
-                |request_id, exclude_turns| ClientRequest::ThreadResume {
+            let _: ThreadResumeResponse =
+                request(&handle, |request_id| ClientRequest::ThreadResume {
                     request_id,
                     params: ThreadResumeParams {
                         thread_id: arguments.thread_id.clone(),
-                        exclude_turns,
+                        exclude_turns: true,
                         config: mcp_config.clone(),
                         ..ThreadResumeParams::default()
                     },
-                },
-            )
-            .await?;
+                })
+                .await?;
             register_background_thread(
                 app_event_tx,
                 &arguments.thread_id,
@@ -899,32 +832,10 @@ async fn execute_inner(
                                 ),
                             )
                             .await;
-                            let latest_turn = match turns_page {
-                                Ok(Ok(page)) => page.data.into_iter().next(),
-                                Ok(Err(TypedRequestError::Server { source, .. }))
-                                    if crate::app_server_session::is_history_pagination_unsupported(
-                                        &source,
-                                    ) =>
-                                {
-                                    tokio::time::timeout_at(
-                                        target_deadline,
-                                        request::<ThreadReadResponse>(&handle, |request_id| {
-                                            ClientRequest::ThreadRead {
-                                                request_id,
-                                                params: ThreadReadParams {
-                                                    thread_id: thread.id.clone(),
-                                                    include_turns: true,
-                                                },
-                                            }
-                                        }),
-                                    )
-                                    .await
-                                    .ok()
-                                    .and_then(Result::ok)
-                                    .and_then(|response| response.thread.turns.into_iter().next_back())
-                                }
-                                _ => None,
-                            };
+                            let latest_turn = turns_page
+                                .ok()
+                                .and_then(Result::ok)
+                                .and_then(|page| page.data.into_iter().next());
                             let latest_items = if let Some(turn) = &latest_turn {
                                 tokio::time::timeout_at(
                                     target_deadline,
@@ -1234,29 +1145,6 @@ async fn request<T: DeserializeOwned>(
         ))))
         .await
         .map_err(|error| error.to_string())
-}
-
-async fn request_with_history_fallback<T: DeserializeOwned>(
-    handle: &AppServerRequestHandle,
-    exclude_turns: bool,
-    mut build: impl FnMut(RequestId, bool) -> ClientRequest,
-) -> Result<T, String> {
-    let request_id = || RequestId::String(format!("tui-dynamic-{}", Uuid::new_v4()));
-    match handle
-        .request_typed(build(request_id(), exclude_turns))
-        .await
-    {
-        Err(TypedRequestError::Server { source, .. })
-            if exclude_turns
-                && crate::app_server_session::is_history_pagination_unsupported(&source) =>
-        {
-            handle
-                .request_typed(build(request_id(), /*exclude_turns*/ false))
-                .await
-                .map_err(|error| error.to_string())
-        }
-        result => result.map_err(|error| error.to_string()),
-    }
 }
 
 async fn read_thread(handle: &AppServerRequestHandle, thread_id: &str) -> Result<Thread, String> {

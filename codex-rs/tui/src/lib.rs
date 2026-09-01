@@ -108,6 +108,7 @@ mod approval_events;
 mod ascii_animation;
 mod bottom_pane;
 mod branch_summary;
+mod cch;
 mod chatwidget;
 mod cli;
 mod clipboard_copy;

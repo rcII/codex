@@ -152,6 +152,49 @@ pub(super) async fn flush_thread(
     write_and_project(store, thread_id, RolloutWriteOp::Flush).await
 }
 
+pub(super) async fn strict_paginated_history_revision(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<crate::StrictHistorySnapshot> {
+    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let (recorder, rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
+    if history_mode != ThreadHistoryMode::Paginated {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!("thread {thread_id} does not use strict paginated history"),
+        });
+    }
+
+    durable_write(&recorder, RolloutWriteOp::Persist).await?;
+    let rollout_path = recorder.rollout_path();
+    super::thread_history_materialization::materialize_to_sqlite(store, rollout_id, rollout_path)
+        .await?;
+    let state = super::thread_history::projection_state(store, rollout_id)
+        .await?
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!("thread {thread_id} has no strict paginated projection"),
+        })?;
+    let durable_len = tokio::fs::metadata(rollout_path)
+        .await
+        .map_err(thread_store_io_error)?
+        .len();
+    if state.next_byte_offset != durable_len {
+        return Err(ThreadStoreError::Internal {
+            message: format!("strict paginated projection for thread {thread_id} is incomplete"),
+        });
+    }
+    let source_high_water_ordinal =
+        state
+            .next_ordinal
+            .checked_sub(1)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: format!("strict paginated history for thread {thread_id} is empty"),
+            })?;
+    Ok(crate::StrictHistorySnapshot {
+        revision: rollout_id.to_string(),
+        source_high_water_ordinal,
+    })
+}
+
 pub(super) async fn shutdown_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,

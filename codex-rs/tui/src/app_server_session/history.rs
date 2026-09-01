@@ -22,6 +22,7 @@ use codex_app_server_protocol::TurnItemsView;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
+use color_eyre::eyre::bail;
 
 pub(crate) const INITIAL_HISTORY_TURN_LIMIT: u32 = 5;
 pub(crate) const HISTORY_ITEM_PAGE_LIMIT: u32 = 100;
@@ -191,10 +192,10 @@ impl AppServerSession {
         Ok(items)
     }
 
-    /// Hydrates paginated threads through bounded turn and item pages.
+    /// Hydrates native paginated threads through bounded turn and item pages.
     ///
-    /// Legacy servers expose neither paging method, so only legacy threads may
-    /// use `thread/read(includeTurns: true)` to preserve their existing history.
+    /// Legacy history is deliberately unsupported: issuing a full-history read
+    /// would make the work unbounded and would bypass the native page contract.
     pub(crate) async fn hydrate_initial_thread_history(
         &mut self,
         thread: &mut Thread,
@@ -206,13 +207,9 @@ impl AppServerSession {
         let thread_id = ThreadId::from_string(&thread.id)
             .wrap_err("invalid thread id in bounded history response")?;
         if thread.history_mode == ThreadHistoryMode::Legacy {
-            if thread.turns.is_empty() {
-                thread.turns = Box::pin(self.thread_read(thread_id, /*include_turns*/ true))
-                    .await?
-                    .turns;
-            }
-            self.history_pagination.entry(thread_id).or_default();
-            return Ok(());
+            bail!(
+                "thread {thread_id} does not expose native paginated history; refusing an unbounded legacy history read"
+            );
         }
 
         let page = self.thread_turns_page(thread_id, turn_cursor).await?;

@@ -423,14 +423,17 @@ INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_
     .execute(&pool)
     .await
     .expect("older writers should be able to append multiple items after migration");
-    let ordinals = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT rollout_ordinal, updated_at_ordinal FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal",
+    let ordinals = sqlx::query_as::<_, (i64, i64, Option<i64>)>(
+        "SELECT rollout_ordinal, updated_at_ordinal, completed_at_ms FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal",
     )
     .bind("thread-1")
     .fetch_all(&pool)
     .await
     .expect("old-writer items should load");
-    assert_eq!(ordinals, vec![(11, 11), (12, 12), (13, 0), (14, 0)]);
+    assert_eq!(
+        ordinals,
+        vec![(11, 11, None), (12, 12, None), (13, 0, None), (14, 0, None),]
+    );
 
     pool.close().await;
 }

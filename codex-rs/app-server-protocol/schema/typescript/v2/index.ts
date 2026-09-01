@@ -483,6 +483,7 @@ export type { ThreadInjectItemsParams } from "./ThreadInjectItemsParams";
 export type { ThreadInjectItemsResponse } from "./ThreadInjectItemsResponse";
 export type { ThreadItem } from "./ThreadItem";
 export type { ThreadItemEntry } from "./ThreadItemEntry";
+export type { ThreadItemHistoryEntry } from "./ThreadItemHistoryEntry";
 export type { ThreadItemsListParams } from "./ThreadItemsListParams";
 export type { ThreadItemsListResponse } from "./ThreadItemsListResponse";
 export type { ThreadListParams } from "./ThreadListParams";
@@ -555,6 +556,7 @@ export type { ThreadStatusChangedNotification } from "./ThreadStatusChangedNotif
 export type { ThreadTimelineEntry } from "./ThreadTimelineEntry";
 export type { ThreadTokenUsage } from "./ThreadTokenUsage";
 export type { ThreadTokenUsageUpdatedNotification } from "./ThreadTokenUsageUpdatedNotification";
+export type { ThreadTurnHistoryEntry } from "./ThreadTurnHistoryEntry";
 export type { ThreadTurnsListParams } from "./ThreadTurnsListParams";
 export type { ThreadTurnsListResponse } from "./ThreadTurnsListResponse";
 export type { ThreadUnarchiveParams } from "./ThreadUnarchiveParams";

@@ -8,6 +8,9 @@ use codex_app_server_protocol::ThreadItem;
 use codex_protocol::ThreadId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::FileChangeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
@@ -15,8 +18,10 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
@@ -37,6 +42,7 @@ use codex_rollout::RolloutLine;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
 use codex_utils_absolute_path::test_support::PathExt;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -47,6 +53,8 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ForkBoundary;
+use crate::ItemSortKey;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::PersistContext;
@@ -429,6 +437,106 @@ WHERE thread_id = ?
     .await
     .expect("read projection state");
     assert_eq!(projection_state, (rollout_len, 5));
+}
+
+#[tokio::test]
+async fn command_and_file_completion_times_survive_pagination_and_restart() {
+    let home = TempDir::new().expect("temp dir");
+    let thread_id = ThreadId::default();
+    let store = projection_store_for_paginated_thread(home.path(), thread_id).await;
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist session metadata");
+    let command = TurnItem::CommandExecution(CommandExecutionItem {
+        id: "command-1".to_string(),
+        plugin_id: None,
+        script_path: None,
+        process_id: None,
+        command: vec!["pwd".to_string()],
+        cwd: PathUri::from_host_native_path(home.path()).expect("absolute test cwd"),
+        parsed_cmd: Vec::new(),
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+        status: CommandExecutionStatus::Completed,
+        stdout: Some(home.path().display().to_string()),
+        stderr: None,
+        aggregated_output: Some(home.path().display().to_string()),
+        exit_code: Some(0),
+        duration: Some(Duration::from_millis(1)),
+        formatted_output: None,
+    });
+    let file_change = TurnItem::FileChange(FileChangeItem {
+        id: "file-1".to_string(),
+        changes: Default::default(),
+        status: Some(PatchApplyStatus::Completed),
+        auto_approved: None,
+        stdout: None,
+        stderr: None,
+    });
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_started("turn-1"),
+                completed_item_at(thread_id, "turn-1", command, 101),
+                completed_item_at(thread_id, "turn-1", file_change, 202),
+                turn_completed("turn-1"),
+            ],
+        })
+        .await
+        .expect("append completed native items");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("persisted rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close rollout before restart");
+    drop(store);
+
+    let restarted = projection_store(home.path()).await;
+    restarted
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout_path),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume persisted paginated rollout");
+    let params = ListItemsParams {
+        thread_id,
+        turn_id: Some("turn-1".to_string()),
+        include_archived: false,
+        cursor: None,
+        page_size: 1,
+        sort_direction: SortDirection::Asc,
+        sort_key: ItemSortKey::UpdatedAtOrdinal,
+        after_updated_at_ordinal: Some(0),
+    };
+    let first = restarted
+        .list_items(params.clone())
+        .await
+        .expect("first completed item page");
+    assert_eq!(first.items[0].item_id, "command-1");
+    assert_eq!(first.items[0].completed_at_ms, Some(101));
+    let second = restarted
+        .list_items(ListItemsParams {
+            cursor: first.next_cursor,
+            ..params
+        })
+        .await
+        .expect("second completed item page");
+    assert_eq!(second.items[0].item_id, "file-1");
+    assert_eq!(second.items[0].completed_at_ms, Some(202));
 }
 
 #[tokio::test]
@@ -1484,26 +1592,8 @@ WHERE thread_id = ? AND turn_id = ?
 #[tokio::test]
 async fn summary_items_use_final_answers_and_ignore_commentary() {
     let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
     let thread_id = ThreadId::default();
-    let runtime = codex_state::StateRuntime::init(
-        config.sqlite.clone(),
-        config.default_model_provider_id.clone(),
-    )
-    .await
-    .expect("state runtime");
-    let mut builder = codex_state::ThreadMetadataBuilder::new(
-        thread_id,
-        home.path().join("missing-rollout.jsonl"),
-        Utc::now(),
-        SessionSource::Cli,
-    );
-    builder.history_mode = ThreadHistoryMode::Paginated;
-    runtime
-        .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
-        .await
-        .expect("seed thread metadata");
-    let store = LocalThreadStore::new(config, Some(runtime));
+    let store = projection_store_for_paginated_thread(home.path(), thread_id).await;
     create_paginated_thread(&store, thread_id).await;
     store
         .persist_thread(thread_id, PersistContext::Standard)
@@ -2481,6 +2571,31 @@ async fn projection_store(codex_home: &Path) -> LocalThreadStore {
     LocalThreadStore::new(config, Some(state_db))
 }
 
+async fn projection_store_for_paginated_thread(
+    codex_home: &Path,
+    thread_id: ThreadId,
+) -> LocalThreadStore {
+    let config = test_config(codex_home);
+    let runtime = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("state runtime");
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        codex_home.join("missing-rollout.jsonl"),
+        Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.history_mode = ThreadHistoryMode::Paginated;
+    runtime
+        .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+        .await
+        .expect("seed thread metadata");
+    LocalThreadStore::new(config, Some(runtime))
+}
+
 async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) {
     create_paginated_subagent_thread(
         store, thread_id, /*history_base*/ None, /*subagent_history_start_ordinal*/ None,
@@ -2588,12 +2703,21 @@ fn contains_user_message(items: &[RolloutItem], expected: &str) -> bool {
 }
 
 fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> RolloutItem {
+    completed_item_at(thread_id, turn_id, item, 1)
+}
+
+fn completed_item_at(
+    thread_id: ThreadId,
+    turn_id: &str,
+    item: TurnItem,
+    completed_at_ms: i64,
+) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
         thread_id,
         turn_id: turn_id.to_string(),
         item,
         started_at_ms: Some(0),
-        completed_at_ms: 1,
+        completed_at_ms,
     }))
 }
 

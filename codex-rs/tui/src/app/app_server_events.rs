@@ -62,8 +62,12 @@ impl App {
             AppServerEvent::Lagged { skipped } => {
                 tracing::warn!(
                     skipped,
-                    "app-server event consumer lagged; dropping ignored events"
+                    "app-server event consumer lagged; reconciling registered CCH threads"
                 );
+                if let Some(cch) = app_server_client.cch_integration() {
+                    cch.reconcile_history_threads(app_server_client.request_handle())
+                        .await;
+                }
                 self.refresh_mcp_startup_expected_servers_from_config();
                 self.chat_widget.finish_mcp_startup_after_lag();
                 self.refresh_agents_overview_threads(app_server_client);
@@ -77,6 +81,9 @@ impl App {
                     .await;
             }
             AppServerEvent::Disconnected { message } => {
+                if let Some(cch) = app_server_client.cch_integration() {
+                    cch.shutdown_history().await;
+                }
                 tracing::warn!("app-server event stream disconnected: {message}");
                 self.chat_widget.add_error_message(message.clone());
                 self.app_event_tx.send(AppEvent::FatalExitRequest(message));
@@ -101,6 +108,40 @@ impl App {
             )
         {
             return;
+        }
+        if let Some(cch) = app_server_client.cch_integration() {
+            let result = match &notification {
+                ServerNotification::TurnCompleted(completed) => {
+                    cch.history_turn_completed(
+                        app_server_client.request_handle(),
+                        &completed.thread_id,
+                    )
+                    .await
+                }
+                ServerNotification::ThreadReverted(reverted) => {
+                    cch.history_turn_completed(
+                        app_server_client.request_handle(),
+                        &reverted.thread_id,
+                    )
+                    .await
+                }
+                ServerNotification::ThreadArchived(thread) => {
+                    cch.forget_history_thread(&thread.thread_id).await;
+                    Ok(())
+                }
+                ServerNotification::ThreadDeleted(thread) => {
+                    cch.forget_history_thread(&thread.thread_id).await;
+                    Ok(())
+                }
+                ServerNotification::ThreadClosed(thread) => {
+                    cch.forget_history_thread(&thread.thread_id).await;
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, "native CCH history lifecycle event failed closed");
+            }
         }
         // Hidden helper threads must not enter visible thread routing or overview refreshes.
         if let ServerNotificationThreadTarget::Thread(thread_id) =

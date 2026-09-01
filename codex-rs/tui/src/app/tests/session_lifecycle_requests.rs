@@ -367,7 +367,7 @@ async fn removing_remote_thread_omits_disconnect_guidance() -> Result<()> {
     ] {
         let (mut app, codex_home) = make_history_test_app().await?;
         let thread_id = ThreadId::from_string(
-            &create_fake_rollout(
+            &create_fake_paginated_rollout(
                 codex_home.path(),
                 "2026-01-01T00-00-00",
                 "2026-01-01T00:00:00Z",
@@ -479,6 +479,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
+        /*cch*/ None,
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -636,6 +637,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         crate::app_server_session::ThreadParamsMode::Embedded,
         /*remote_cwd_override*/ None,
         app_server.thread_tool_transport(),
+        /*cch*/ None,
     )
     .await?;
     assert!(startup.task_tools_available);
@@ -707,7 +709,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         .set(codex_protocol::config_types::WebSearchMode::Disabled)?;
     let delegation_source = create_history_rollout(
         &app.config,
-        ThreadHistoryMode::Legacy,
+        ThreadHistoryMode::Paginated,
         "Approved task source",
     )?;
     app_server
@@ -934,7 +936,8 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
 }
 
 #[tokio::test]
-async fn older_external_server_starts_without_unsupported_dynamic_tools_or_history() -> Result<()> {
+async fn older_external_server_fails_closed_without_native_dynamic_tools_or_history() -> Result<()>
+{
     let (app, _codex_home) = make_history_test_app().await?;
     let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
         &app.config,
@@ -945,29 +948,16 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
     )
     .await?;
 
-    let started = app_server.start_thread(&app.config).await?;
-    assert!(!started.task_tools_available);
-    assert!(!app_server.task_tools_available(started.session.thread_id));
-    let startup = crate::app_server_session::start_thread_with_request_handle(
-        app_server.request_handle(),
-        app.config.clone(),
-        crate::app_server_session::ThreadParamsMode::Embedded,
-        /*remote_cwd_override*/ None,
-        app_server.thread_tool_transport(),
-    )
-    .await?;
-    assert!(!startup.task_tools_available);
+    let error = app_server
+        .start_thread(&app.config)
+        .await
+        .expect_err("unsupported native contract must fail closed");
+    assert!(error.to_string().contains("missing field `inputSchema`"));
 
     let starts = recorded_params(&requests, "thread/start");
-    assert_eq!(starts.len(), 6);
-    for attempts in starts.chunks_exact(3) {
-        assert_eq!(attempts[0]["dynamicTools"][0]["type"], "namespace");
-        assert_eq!(attempts[0]["historyMode"], "paginated");
-        assert_eq!(attempts[1]["dynamicTools"], serde_json::Value::Null);
-        assert_eq!(attempts[1]["historyMode"], "paginated");
-        assert_eq!(attempts[2]["dynamicTools"], serde_json::Value::Null);
-        assert_eq!(attempts[2]["historyMode"], serde_json::Value::Null);
-    }
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["dynamicTools"][0]["type"], "namespace");
+    assert_eq!(starts[0]["historyMode"], "paginated");
 
     app_server.shutdown().await?;
     proxy.await??;
@@ -1175,7 +1165,7 @@ async fn dynamic_tool_requests_ignore_other_namespaces_and_dispatch_tui_namespac
 
     let creation_source = create_history_rollout(
         &app.config,
-        ThreadHistoryMode::Legacy,
+        ThreadHistoryMode::Paginated,
         "Background task source",
     )?;
     app_server
@@ -1770,105 +1760,7 @@ async fn transcript_home_loads_every_older_history_page() -> Result<()> {
 }
 
 #[tokio::test]
-async fn remote_legacy_history_start_negotiates_once_for_resume_and_fork() -> Result<()> {
-    let (app, _codex_home) = make_history_test_app().await?;
-    let legacy_thread_id =
-        create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "legacy history")?;
-    let paginated_thread_id = create_history_rollout(
-        &app.config,
-        ThreadHistoryMode::Paginated,
-        "paginated history",
-    )?;
-    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
-        &app.config,
-        HistoryCapabilities::LegacyOnly,
-        /*blocked_thread_list*/ None,
-        /*failed_thread_name*/ None,
-        crate::app_server_session::ThreadParamsMode::Embedded,
-    )
-    .await?;
-
-    let started = app_server.start_thread(&app.config).await?;
-    let resumed = app_server
-        .resume_thread(
-            app.config.clone(),
-            legacy_thread_id,
-            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
-        )
-        .await?;
-    let forked = app_server
-        .fork_thread(app.config.clone(), legacy_thread_id)
-        .await?;
-
-    assert_ne!(started.session.thread_id, legacy_thread_id);
-    assert_eq!(resumed.session.thread_id, legacy_thread_id);
-    assert_ne!(forked.session.thread_id, legacy_thread_id);
-    let starts = recorded_params(&requests, "thread/start");
-    assert_eq!(starts.len(), 2);
-    assert_eq!(starts[0]["historyMode"], "paginated");
-    assert_eq!(starts[1]["historyMode"], serde_json::Value::Null);
-
-    for method in ["thread/resume", "thread/fork"] {
-        let params = recorded_params(&requests, method);
-        assert_eq!(params.len(), 1, "legacy {method} must not be reprobed");
-        assert_ne!(params[0]["excludeTurns"], true);
-    }
-    assert!(recorded_params(&requests, "thread/turns/list").is_empty());
-    assert!(recorded_params(&requests, "thread/items/list").is_empty());
-
-    let initial_read_count = recorded_params(&requests, "thread/read").len();
-    let exported = crate::app::transcript_export::load_export_transcript(
-        &mut app_server,
-        paginated_thread_id,
-        crate::thread_transcript::RawReasoningVisibility::Hidden,
-        Some(&app.config),
-        vec![Arc::new(PlainHistoryCell::new(vec!["visible".into()]))],
-    )
-    .await
-    .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    assert_eq!(exported[0].raw_lines()[0].to_string(), "visible");
-    assert!(
-        recorded_params(&requests, "thread/read")[initial_read_count..]
-            .iter()
-            .any(|params| params["includeTurns"] == true)
-    );
-    assert_eq!(recorded_params(&requests, "thread/turns/list").len(), 1);
-
-    let (_status_sender, status_updates) = tokio::sync::broadcast::channel(/*capacity*/ 1);
-    let response = crate::dynamic_tools::execute(
-        app_server.request_handle(),
-        codex_app_server_protocol::DynamicToolCallParams {
-            thread_id: started.session.thread_id.to_string(),
-            turn_id: "source-turn".to_string(),
-            call_id: "legacy-wait".to_string(),
-            namespace: Some(crate::dynamic_tools::NAMESPACE.to_string()),
-            tool: "wait_threads".to_string(),
-            arguments: serde_json::json!({
-                "targets": [{"threadId": legacy_thread_id}],
-                "timeoutMs": 0
-            }),
-        },
-        codex_app_server_protocol::ThreadStartParams::default(),
-        status_updates,
-        /*app_event_tx*/ None,
-    )
-    .await;
-    assert!(response.success, "{response:?}");
-    assert!(
-        recorded_params(&requests, "thread/read")
-            .iter()
-            .any(|params| {
-                params["threadId"] == legacy_thread_id.to_string() && params["includeTurns"] == true
-            })
-    );
-
-    app_server.shutdown().await?;
-    proxy.await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn remote_legacy_history_start_retries_unsupported_paginated_variant() -> Result<()> {
+async fn remote_history_start_fails_closed_on_unsupported_paginated_variant() -> Result<()> {
     let (app, _codex_home) = make_history_test_app().await?;
     let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
         &app.config,
@@ -1879,28 +1771,27 @@ async fn remote_legacy_history_start_retries_unsupported_paginated_variant() -> 
     )
     .await?;
 
-    app_server.start_thread(&app.config).await?;
+    let error = app_server
+        .start_thread(&app.config)
+        .await
+        .expect_err("unsupported native history must fail closed");
+    assert!(error.to_string().contains("unknown variant \"paginated\""));
 
     let starts = recorded_params(&requests, "thread/start");
-    assert_eq!(starts.len(), 2);
+    assert_eq!(starts.len(), 1);
     assert_eq!(starts[0]["historyMode"], "paginated");
-    assert_eq!(starts[1]["historyMode"], serde_json::Value::Null);
+    assert!(recorded_params(&requests, "thread/read").is_empty());
 
     app_server.shutdown().await?;
     proxy.await??;
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LegacyHistoryRequest {
-    Resume,
-    Fork,
-}
-
-async fn assert_remote_legacy_history_retry(request: LegacyHistoryRequest) -> Result<()> {
+#[tokio::test]
+async fn remote_history_resume_fails_closed_without_legacy_retry() -> Result<()> {
     let (app, _codex_home) = make_history_test_app().await?;
-    let legacy_thread_id =
-        create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "legacy history")?;
+    let thread_id =
+        create_history_rollout(&app.config, ThreadHistoryMode::Paginated, "native history")?;
     let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
         &app.config,
         HistoryCapabilities::LegacyOnly,
@@ -1910,36 +1801,22 @@ async fn assert_remote_legacy_history_retry(request: LegacyHistoryRequest) -> Re
     )
     .await?;
 
-    let method = match request {
-        LegacyHistoryRequest::Resume => {
-            let resumed = app_server
-                .resume_thread(
-                    app.config.clone(),
-                    legacy_thread_id,
-                    crate::app_server_session::ResumeModelSettings::RestoreFromThread,
-                )
-                .await?;
-            assert_eq!(resumed.session.thread_id, legacy_thread_id);
-            "thread/resume"
-        }
-        LegacyHistoryRequest::Fork => {
-            let forked = app_server
-                .fork_thread(app.config.clone(), legacy_thread_id)
-                .await?;
-            assert_ne!(forked.session.thread_id, legacy_thread_id);
-            "thread/fork"
-        }
-    };
-    let attempts = recorded_params(&requests, method);
-    if request == LegacyHistoryRequest::Resume {
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0]["excludeTurns"], true);
-    } else {
-        assert_eq!(attempts.len(), 1);
-    }
-    assert_ne!(
-        attempts.last().expect("history request")["excludeTurns"],
-        true
+    let error = app_server
+        .resume_thread(
+            app.config.clone(),
+            thread_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await
+        .expect_err("unsupported native resume must fail closed");
+    assert!(error.to_string().contains("method not found"));
+    let attempts = recorded_params(&requests, "thread/resume");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["excludeTurns"], true);
+    assert!(
+        recorded_params(&requests, "thread/read")
+            .iter()
+            .all(|params| params["includeTurns"] != true)
     );
     assert!(recorded_params(&requests, "thread/turns/list").is_empty());
     assert!(recorded_params(&requests, "thread/items/list").is_empty());
@@ -1950,13 +1827,38 @@ async fn assert_remote_legacy_history_retry(request: LegacyHistoryRequest) -> Re
 }
 
 #[tokio::test]
-async fn remote_legacy_history_resume_retries_generic_method_not_found() -> Result<()> {
-    assert_remote_legacy_history_retry(LegacyHistoryRequest::Resume).await
-}
+async fn remote_history_fork_fails_closed_without_legacy_retry() -> Result<()> {
+    let (app, _codex_home) = make_history_test_app().await?;
+    let thread_id =
+        create_history_rollout(&app.config, ThreadHistoryMode::Paginated, "native history")?;
+    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::LegacyOnly,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await?;
 
-#[tokio::test]
-async fn remote_legacy_history_fork_avoids_unsupported_fields() -> Result<()> {
-    assert_remote_legacy_history_retry(LegacyHistoryRequest::Fork).await
+    let error = app_server
+        .fork_thread(app.config.clone(), thread_id)
+        .await
+        .expect_err("unsupported native fork must fail closed");
+    assert!(error.to_string().contains("method not found"));
+    let attempts = recorded_params(&requests, "thread/fork");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["excludeTurns"], true);
+    assert!(
+        recorded_params(&requests, "thread/read")
+            .iter()
+            .all(|params| params["includeTurns"] != true)
+    );
+    assert!(recorded_params(&requests, "thread/turns/list").is_empty());
+    assert!(recorded_params(&requests, "thread/items/list").is_empty());
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -2256,19 +2158,21 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     assert_eq!(preview_include_turns, vec![false]);
 
     let previous_read_count = preview_reads.len();
-    crate::thread_transcript::load_session_transcript(
+    let error = crate::thread_transcript::load_session_transcript(
         &mut app_server,
         legacy_thread_id,
         crate::thread_transcript::RawReasoningVisibility::Hidden,
         Some(&app.config),
     )
-    .await?;
+    .await
+    .expect_err("legacy transcript hydration must fail closed");
+    assert!(error.to_string().contains("native paginated history"));
     let legacy_reads = recorded_params(&requests, "thread/read");
     let legacy_include_turns = legacy_reads[previous_read_count..]
         .iter()
         .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
         .collect::<Vec<_>>();
-    assert_eq!(legacy_include_turns, vec![false, true]);
+    assert_eq!(legacy_include_turns, vec![false]);
 
     app_server.shutdown().await?;
     proxy.await??;
@@ -2284,14 +2188,13 @@ async fn agents_overview_stop_uses_history_mode_for_turn_lookup() -> Result<()> 
         "paginated background task",
     )?;
     let cases = [
-        (paginated_thread_id, vec![false], 1),
+        (paginated_thread_id, 1),
         (
             create_history_rollout(
                 &app.config,
                 ThreadHistoryMode::Legacy,
                 "legacy background task",
             )?,
-            vec![false, true],
             0,
         ),
     ];
@@ -2304,7 +2207,7 @@ async fn agents_overview_stop_uses_history_mode_for_turn_lookup() -> Result<()> 
     )
     .await?;
 
-    for (thread_id, expected_include_turns, expected_turn_page_count) in cases {
+    for (thread_id, expected_turn_page_count) in cases {
         let previous_reads = recorded_params(&requests, "thread/read");
         let previous_turn_page_count = recorded_params(&requests, "thread/turns/list").len();
 
@@ -2316,45 +2219,12 @@ async fn agents_overview_stop_uses_history_mode_for_turn_lookup() -> Result<()> 
             .iter()
             .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
             .collect::<Vec<_>>();
-        assert_eq!(include_turns, expected_include_turns);
+        assert_eq!(include_turns, vec![false]);
         assert_eq!(
             recorded_params(&requests, "thread/turns/list").len() - previous_turn_page_count,
             expected_turn_page_count
         );
     }
-
-    app_server.shutdown().await?;
-    proxy.await??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn agents_overview_stop_uses_full_history_after_legacy_negotiation() -> Result<()> {
-    let (mut app, _codex_home) = make_history_test_app().await?;
-    let thread_id = create_history_rollout(
-        &app.config,
-        ThreadHistoryMode::Paginated,
-        "paginated background task",
-    )?;
-    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
-        &app.config,
-        HistoryCapabilities::LegacyOnly,
-        /*blocked_thread_list*/ None,
-        /*failed_thread_name*/ None,
-        crate::app_server_session::ThreadParamsMode::Embedded,
-    )
-    .await?;
-    app_server.start_thread(&app.config).await?;
-
-    app.stop_agents_overview_thread(&mut app_server, thread_id)
-        .await;
-
-    let include_turns = recorded_params(&requests, "thread/read")
-        .into_iter()
-        .map(|params| params["includeTurns"].as_bool().unwrap_or(false))
-        .collect::<Vec<_>>();
-    assert_eq!(include_turns, vec![false, true]);
-    assert!(recorded_params(&requests, "thread/turns/list").is_empty());
 
     app_server.shutdown().await?;
     proxy.await??;
@@ -2934,7 +2804,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
                 let root_timestamp = "2026-01-01T00-00-00";
                 let root_thread_id = ThreadId::from_string(
-                    &create_fake_rollout(
+                    &create_fake_paginated_rollout(
                         codex_home.path(),
                         root_timestamp,
                         "2026-01-01T00:00:00Z",
@@ -2966,6 +2836,27 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     )
                     .expect("create child rollout"),
                 )?;
+                let child_rollout_path = rollout_path(
+                    codex_home.path(),
+                    "2026-01-01T00-00-01",
+                    &child_thread_id.to_string(),
+                );
+                let mut child_lines = std::fs::read_to_string(&child_rollout_path)?
+                    .lines()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .collect::<Result<Vec<_>, _>>()?;
+                child_lines[0]["payload"]["history_mode"] =
+                    serde_json::to_value(ThreadHistoryMode::Paginated)?;
+                child_lines[0]["payload"]["subagent_history_start_ordinal"] = serde_json::json!(1);
+                for (ordinal, line) in child_lines.iter_mut().enumerate() {
+                    line["ordinal"] = serde_json::json!(ordinal);
+                }
+                let child_contents = child_lines
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(&child_rollout_path, format!("{child_contents}\n"))?;
                 let root_rollout_path = rollout_path(
                     codex_home.path(),
                     root_timestamp,

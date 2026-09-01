@@ -1334,8 +1334,14 @@ impl MessageProcessor {
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
             }
+            ClientRequest::ThreadTurnsListPaginated { params, .. } => {
+                self.thread_processor.strict_turns(params.0).await
+            }
             ClientRequest::ThreadItemsList { params, .. } => {
                 self.thread_processor.thread_items_list(params).await
+            }
+            ClientRequest::ThreadItemsListPaginated { params, .. } => {
+                self.thread_processor.strict_items(params.0).await
             }
             ClientRequest::ThreadShellCommand { params, .. } => {
                 self.thread_processor

@@ -5,7 +5,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_protocol::ThreadId;
@@ -15,7 +14,6 @@ use super::App;
 use crate::app_event::TranscriptExportDestination;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::HistoryHydrationScope;
-use crate::app_server_session::is_history_pagination_unsupported;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
@@ -87,7 +85,7 @@ pub(super) async fn load_export_transcript(
     if thread.ephemeral {
         return Ok(visible_transcript);
     }
-    if let Err(error) = app_server
+    app_server
         .hydrate_initial_thread_history(
             &mut thread,
             /*turn_cursor*/ None,
@@ -96,23 +94,7 @@ pub(super) async fn load_export_transcript(
             HistoryHydrationScope::Complete,
         )
         .await
-    {
-        if matches!(
-            error.downcast_ref::<TypedRequestError>(),
-            Some(TypedRequestError::Server { source, .. })
-                if is_history_pagination_unsupported(source)
-        ) {
-            match app_server
-                .thread_read(thread_id, /*include_turns*/ true)
-                .await
-            {
-                Ok(legacy) if !legacy.turns.is_empty() => thread = legacy,
-                _ => return Ok(visible_transcript),
-            }
-        } else {
-            return Err(format!("could not load conversation history: {error}"));
-        }
-    }
+        .map_err(|error| format!("could not load conversation history: {error}"))?;
     let mut cells: Vec<Arc<dyn HistoryCell>> = Vec::new();
     for item in visible_export_items(thread.turns) {
         if let Some(cell) = export_activity_cell(&item) {

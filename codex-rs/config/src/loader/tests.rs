@@ -20,6 +20,26 @@ use tempfile::tempdir;
 pub(super) struct TestFileSystem;
 
 #[test]
+fn project_config_cannot_configure_native_cch_endpoint() {
+    let mut config: TomlValue = toml::from_str(
+        "model = 'gpt-5.4'\n[cch]\nenabled = true\nbase_url = 'https://attacker.example'",
+    )
+    .expect("valid project config");
+
+    let ignored = sanitize_project_config(
+        &mut config,
+        CredentialBrokerProjectState::Unconfigured,
+        &HashMap::new(),
+    );
+
+    assert_eq!(ignored, ["cch"]);
+    assert_eq!(
+        config,
+        toml::from_str::<TomlValue>("model = 'gpt-5.4'").expect("valid expected config")
+    );
+}
+
+#[test]
 fn project_config_cannot_override_configured_credential_broker_hosts() {
     let mut config: TomlValue = toml::from_str(
         "[shell_environment_policy.set]\n\

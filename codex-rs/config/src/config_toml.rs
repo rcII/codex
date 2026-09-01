@@ -62,6 +62,12 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
+mod cch;
+mod orchestrator;
+pub use cch::CchToml;
+pub use orchestrator::OrchestratorFeatureToml;
+pub use orchestrator::OrchestratorToml;
+
 const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
     AMAZON_BEDROCK_PROVIDER_ID,
     AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
@@ -134,25 +140,13 @@ of strings; comma-separated strings are not supported. Use \
     }
 }
 
-/// Orchestrator-owned feature settings.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct OrchestratorToml {
-    pub skills: Option<OrchestratorFeatureToml>,
-    pub mcp: Option<OrchestratorFeatureToml>,
-}
-
-/// Settings for a feature owned by the orchestrator.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct OrchestratorFeatureToml {
-    pub enabled: Option<bool>,
-}
-
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
+    /// Native loopback-only CCH integration. Project-local configuration cannot set this.
+    pub cch: Option<CchToml>,
+
     /// Optional override of model selection.
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.

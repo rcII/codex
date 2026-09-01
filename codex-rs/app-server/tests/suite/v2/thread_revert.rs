@@ -1,6 +1,7 @@
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence;
@@ -25,9 +26,12 @@ use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTurnsListPaginatedParams;
+use codex_app_server_protocol::ThreadTurnsListPaginatedResponse;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -219,6 +223,7 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
         .await?;
     let stale_rollout_path = thread.path.clone().expect("thread rollout path");
     let mut turn_ids = Vec::new();
+    let mut history_revisions = Vec::new();
     for text in ["first", "second"] {
         let completed = mcp
             .start_turn_and_wait_for_completion(TurnStartParams {
@@ -231,7 +236,24 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
             })
             .await?;
         turn_ids.push(completed.turn.id);
+        history_revisions.push(
+            mcp.request::<ThreadTurnsListPaginatedResponse>(|request_id| {
+                ClientRequest::ThreadTurnsListPaginated {
+                    request_id,
+                    params: ThreadTurnsListPaginatedParams(ThreadTurnsListParams {
+                        thread_id: thread.id.clone(),
+                        cursor: None,
+                        limit: Some(1),
+                        sort_direction: Some(SortDirection::Asc),
+                        items_view: Some(TurnItemsView::NotLoaded),
+                    }),
+                }
+            })
+            .await?
+            .history_revision,
+        );
     }
+    assert_eq!(history_revisions[0], history_revisions[1]);
 
     let ThreadRevertResponse {
         thread: reverted_thread,
@@ -252,6 +274,19 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
     )
     .await??;
     assert_eq!(reverted.thread_id, thread.id);
+    let after_revert: ThreadTurnsListPaginatedResponse = mcp
+        .request(|request_id| ClientRequest::ThreadTurnsListPaginated {
+            request_id,
+            params: ThreadTurnsListPaginatedParams(ThreadTurnsListParams {
+                thread_id: thread.id.clone(),
+                cursor: None,
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Asc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            }),
+        })
+        .await?;
+    assert_ne!(history_revisions[1], after_revert.history_revision);
 
     assert_eq!(reverted_thread.id, thread.id);
     assert!(reverted_thread.turns.is_empty());
@@ -374,6 +409,53 @@ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
         .await?,
         vec![turn_ids[0].clone(), third_turn.turn.id]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_paginated_lists_never_fall_back_to_legacy_history() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "legacy history",
+        vec![],
+        Some("mock_provider"),
+        None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+
+    for method in ["thread/turns/listPaginated", "thread/items/listPaginated"] {
+        for requested_thread in [
+            thread_id.clone(),
+            "00000000-0000-4000-8000-000000000123".to_string(),
+        ] {
+            let request_id = mcp
+                .send_request(
+                    method,
+                    Some(serde_json::json!({"threadId": requested_thread})),
+                )
+                .await?;
+            let error: JSONRPCError = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+            )
+            .await??;
+            assert!(
+                error.error.message.contains("strict paginated")
+                    || error.error.message.contains("no rollout found"),
+                "unexpected strict-history error: {}",
+                error.error.message
+            );
+        }
+    }
     Ok(())
 }
 

@@ -427,6 +427,38 @@
       },
       "type": "object"
     },
+    "CchToml": {
+      "additionalProperties": false,
+      "description": "Native Contextual Conversation History settings for a loopback endpoint.",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "bearer_token_env_var": {
+          "description": "Name of the process environment variable containing the CCH bearer token.",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_request_body_bytes": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_response_body_bytes": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "CodeModeConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -5630,6 +5662,14 @@
     },
     "browser_use": {
       "$ref": "#/definitions/BrowserUseConfigToml"
+    },
+    "cch": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CchToml"
+        }
+      ],
+      "description": "Native loopback-only CCH integration. Project-local configuration cannot set this."
     },
     "chatgpt_base_url": {
       "description": "Base URL for requests to ChatGPT (as opposed to the OpenAI API).",

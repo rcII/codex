@@ -6,6 +6,11 @@
 mod fs;
 mod history;
 mod rollout_history;
+mod thread_start;
+pub(crate) use rollout_history::CchHistoryThread;
+pub(crate) use rollout_history::StrictHistorySnapshot;
+pub(crate) use thread_start::request_thread_start;
+pub(crate) use thread_start::start_thread_with_request_handle;
 
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
@@ -14,6 +19,7 @@ pub(crate) use history::thread_items_page_params;
 
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::FeedbackAudience;
+use crate::cch::CchIntegration;
 use crate::dynamic_tools_mcp::DynamicToolMcpServer;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
 use crate::legacy_core::config::Config;
@@ -152,7 +158,6 @@ use uuid::Uuid;
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
-const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
 
@@ -168,97 +173,8 @@ enum ForkPresentation {
     SideConversation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ThreadHistorySupport {
-    Paginated,
-    LegacyOnly,
-}
-
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
     color_eyre::eyre::eyre!("{context}: {err}")
-}
-
-pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
-    if source.code == JSONRPC_METHOD_NOT_FOUND {
-        return true;
-    }
-
-    if !matches!(
-        source.code,
-        JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS
-    ) {
-        return false;
-    }
-
-    let message = source.message.to_ascii_lowercase();
-    [
-        "historymode",
-        "history mode",
-        "excludeturns",
-        "exclude turns",
-        "thread/turns/list",
-        "thread/items/list",
-    ]
-    .into_iter()
-    .any(|field| message.contains(field))
-        || (message.contains("paginated")
-            && ["unknown variant", "unsupported variant", "invalid enum"]
-                .into_iter()
-                .any(|error| message.contains(error)))
-}
-
-pub(crate) async fn request_thread_start_with_history_fallback(
-    request_handle: &AppServerRequestHandle,
-    mut request_id: RequestId,
-    mut params: ThreadStartParams,
-) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
-    let mut history_support = ThreadHistorySupport::Paginated;
-    loop {
-        match request_handle
-            .request_typed(ClientRequest::ThreadStart {
-                request_id,
-                params: params.clone(),
-            })
-            .await
-        {
-            Ok(response) => {
-                let task_tools_available = params.dynamic_tools.is_some()
-                    || params
-                        .config
-                        .as_ref()
-                        .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
-                return Ok((response, history_support, task_tools_available));
-            }
-            Err(TypedRequestError::Server { source, .. })
-                if params.history_mode.is_some() && is_history_pagination_unsupported(&source) =>
-            {
-                params.history_mode = None;
-                history_support = ThreadHistorySupport::LegacyOnly;
-                request_id = RequestId::String(format!("legacy-thread-start-{}", Uuid::new_v4()));
-            }
-            Err(TypedRequestError::Server { source, .. })
-                if params.dynamic_tools.is_some()
-                    && matches!(
-                        source.code,
-                        JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS
-                    )
-                    && {
-                        let message = source.message.to_ascii_lowercase();
-                        ["dynamictools", "dynamic tool", "namespace", "inputschema"]
-                            .into_iter()
-                            .any(|field| message.contains(field))
-                    } =>
-            {
-                tracing::warn!(
-                    error = %source.message,
-                    "app server does not support TUI dynamic tools; starting without them"
-                );
-                params.dynamic_tools = None;
-                request_id = RequestId::String(format!("legacy-thread-start-{}", Uuid::new_v4()));
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -299,12 +215,12 @@ pub(crate) struct AppServerSession {
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
     background_rollout_migration_enabled: bool,
-    history_support: ThreadHistorySupport,
     thread_settings_update_supported: bool,
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_completion_pending: AtomicBool,
+    cch: Option<Arc<CchIntegration>>,
     dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
 }
 
@@ -387,12 +303,12 @@ impl AppServerSession {
             remote_cwd_override: None,
             thread_params_mode,
             background_rollout_migration_enabled: true,
-            history_support: ThreadHistorySupport::Paginated,
             thread_settings_update_supported: true,
             default_model: None,
             available_models: Vec::new(),
             managed_new_thread_defaults: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
+            cch: None,
             dynamic_tool_mcp: None,
         }
     }
@@ -460,6 +376,10 @@ impl AppServerSession {
         } else {
             ThreadToolTransport::Dynamic
         }
+    }
+
+    pub(crate) fn install_cch_integration(&mut self, cch: Option<CchIntegration>) {
+        self.cch = cch.map(Arc::new);
     }
 
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
@@ -536,7 +456,7 @@ impl AppServerSession {
         // requirements together so an uncached model fetch can overlap both config requests.
         let model_request_id = self.next_request_id();
         let requirements_request_id = self.next_request_id();
-        let (models, requirements) = tokio::try_join!(
+        let (models, requirements, cch) = tokio::try_join!(
             async {
                 self.client
                     .request_typed::<ModelListResponse>(ClientRequest::ModelList {
@@ -568,7 +488,15 @@ impl AppServerSession {
                         )
                     })
             },
+            async {
+                CchIntegration::connect(&config.cch).await.map_err(|error| {
+                    color_eyre::eyre::eyre!(
+                        "native CCH contract verification failed during TUI bootstrap: {error}"
+                    )
+                })
+            },
         )?;
+        self.install_cch_integration(cch);
         self.managed_new_thread_defaults = requirements
             .requirements
             .and_then(|requirements| requirements.models)
@@ -650,10 +578,6 @@ impl AppServerSession {
 
     pub(crate) fn managed_new_thread_defaults(&self) -> Option<&NewThreadModelDefaults> {
         self.managed_new_thread_defaults.as_ref()
-    }
-
-    pub(crate) fn supports_paginated_history(&self) -> bool {
-        self.history_support == ThreadHistorySupport::Paginated
     }
 
     /// Fetches the current account info without refreshing the auth token.
@@ -757,19 +681,22 @@ impl AppServerSession {
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
         );
-        if self.history_support == ThreadHistorySupport::LegacyOnly {
-            params.history_mode = None;
-        }
         self.thread_tool_transport().configure(&mut params);
         let request_handle = self.request_handle();
-        let (response, history_support, task_tools_available) =
-            request_thread_start_with_history_fallback(&request_handle, request_id, params)
+        let (response, task_tools_available) =
+            request_thread_start(&request_handle, request_id, params)
                 .await
                 .map_err(|err| {
                     bootstrap_request_error("thread/start failed during TUI bootstrap", err)
                 })?;
-        if history_support == ThreadHistorySupport::LegacyOnly {
-            self.history_support = ThreadHistorySupport::LegacyOnly;
+        if let Some(cch) = self.cch.as_ref() {
+            cch.register_history_thread(
+                request_handle.clone(),
+                response.thread.clone(),
+                "thread/start",
+                /*capture_now*/ false,
+            )
+            .await?;
         }
         let mut started =
             started_thread_from_start_response(response, config, self.thread_params_mode()).await?;
@@ -846,11 +773,7 @@ impl AppServerSession {
                 .ok(),
             ForkPresentation::SideConversation => None,
         };
-        let exclude_turns = self.history_support == ThreadHistorySupport::Paginated
-            && (fork_parent
-                .as_ref()
-                .is_some_and(|thread| thread.history_mode == ThreadHistoryMode::Paginated)
-                || presentation == ForkPresentation::SideConversation);
+        let exclude_turns = true;
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
         let mut params = ThreadForkParams {
@@ -867,35 +790,25 @@ impl AppServerSession {
         };
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
-        let response: ThreadForkResponse = match self
+        let response: ThreadForkResponse = self
             .client
             .request_typed(ClientRequest::ThreadFork {
                 request_id,
                 params: params.clone(),
             })
             .await
-        {
-            Ok(response) => response,
-            Err(TypedRequestError::Server { source, .. })
-                if params.exclude_turns && is_history_pagination_unsupported(&source) =>
-            {
-                self.history_support = ThreadHistorySupport::LegacyOnly;
-                params.exclude_turns = false;
-                let request_id = self.next_request_id();
-                self.client
-                    .request_typed(ClientRequest::ThreadFork { request_id, params })
-                    .await
-                    .map_err(|err| {
-                        bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
-                    })?
-            }
-            Err(err) => {
-                return Err(bootstrap_request_error(
-                    "thread/fork failed during TUI bootstrap",
-                    err,
-                ));
-            }
-        };
+            .map_err(|err| {
+                bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+            })?;
+        if let Some(cch) = self.cch.as_ref() {
+            cch.register_history_thread(
+                self.request_handle(),
+                response.thread.clone(),
+                "thread/fork",
+                /*capture_now*/ true,
+            )
+            .await?;
+        }
         let mut response = response;
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
@@ -1197,6 +1110,11 @@ impl AppServerSession {
         personality: Option<codex_protocol::config_types::Personality>,
         output_schema: Option<serde_json::Value>,
     ) -> Result<TurnStartResponse> {
+        if let Some(cch) = self.cch_integration() {
+            cch.ensure_history_captured(self.request_handle(), &thread_id.to_string())
+                .await
+                .wrap_err("native CCH safe-boundary capture failed before turn/start")?;
+        }
         let request_id = self.next_request_id();
         let (sandbox_policy, permissions) =
             turn_permissions_overrides(permissions_override, cwd.as_path())?;
@@ -1556,6 +1474,9 @@ impl AppServerSession {
     }
 
     pub(crate) async fn shutdown(self) -> std::io::Result<()> {
+        if let Some(cch) = &self.cch {
+            cch.shutdown_history().await;
+        }
         self.client.shutdown().await
     }
 
@@ -1563,38 +1484,15 @@ impl AppServerSession {
         self.client.request_handle()
     }
 
+    pub(crate) fn cch_integration(&self) -> Option<Arc<CchIntegration>> {
+        self.cch.as_ref().map(Arc::clone)
+    }
+
     pub(crate) fn next_request_id(&mut self) -> RequestId {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         RequestId::Integer(request_id)
     }
-}
-
-pub(crate) async fn start_thread_with_request_handle(
-    request_handle: AppServerRequestHandle,
-    config: Config,
-    thread_params_mode: ThreadParamsMode,
-    remote_cwd_override: Option<PathBuf>,
-    thread_tool_transport: ThreadToolTransport,
-) -> Result<AppServerStartedThread> {
-    let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
-    let mut params = thread_start_params_from_config(
-        &config,
-        thread_params_mode,
-        remote_cwd_override.as_deref(),
-        /*session_start_source*/ None,
-    );
-    thread_tool_transport.configure(&mut params);
-    let (response, _history_support, task_tools_available) =
-        request_thread_start_with_history_fallback(&request_handle, request_id, params)
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("thread/start failed during TUI bootstrap", err)
-            })?;
-    let mut started =
-        started_thread_from_start_response(response, &config, thread_params_mode).await?;
-    started.task_tools_available = task_tools_available;
-    Ok(started)
 }
 
 pub(crate) fn status_account_display_from_auth_mode(
@@ -2286,7 +2184,6 @@ mod tests {
     use crate::legacy_core::config::ConfigBuilder;
     use crate::legacy_core::config::ConfigOverrides;
     use app_test_support::create_fake_paginated_rollout;
-    use app_test_support::create_fake_rollout;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -2503,58 +2400,6 @@ mod tests {
             };
             assert_eq!(
                 is_thread_settings_update_unsupported(&source),
-                expected,
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
-    fn history_pagination_compat_detects_unsupported_server_fields() {
-        let cases = [
-            (JSONRPC_INVALID_PARAMS, "unknown field `historyMode`", true),
-            (
-                JSONRPC_INVALID_REQUEST,
-                "thread/resume.excludeTurns requires experimentalApi capability",
-                true,
-            ),
-            (
-                JSONRPC_INVALID_REQUEST,
-                "thread/fork.excludeTurns requires experimentalApi capability",
-                true,
-            ),
-            (
-                JSONRPC_METHOD_NOT_FOUND,
-                "unknown method thread/turns/list",
-                true,
-            ),
-            (JSONRPC_METHOD_NOT_FOUND, "method not found", true),
-            (
-                JSONRPC_INVALID_PARAMS,
-                "unknown variant \"paginated\", expected \"legacy\"",
-                true,
-            ),
-            (
-                JSONRPC_INVALID_PARAMS,
-                "invalid enum value `paginated`",
-                true,
-            ),
-            (
-                JSONRPC_INVALID_PARAMS,
-                "paginated thread was not found",
-                false,
-            ),
-            (JSONRPC_INVALID_PARAMS, "invalid thread id", false),
-        ];
-
-        for (code, message, expected) in cases {
-            let source = JSONRPCErrorError {
-                code,
-                data: None,
-                message: message.to_string(),
-            };
-            assert_eq!(
-                is_history_pagination_unsupported(&source),
                 expected,
                 "{message}"
             );
@@ -3235,7 +3080,7 @@ mod tests {
             .enable(Feature::FastMode)
             .expect("enable fast mode");
         let thread_id = ThreadId::from_string(
-            &create_fake_rollout(
+            &create_fake_paginated_rollout(
                 codex_home.path(),
                 "2025-01-05T12-00-00",
                 "2025-01-05T12:00:00Z",
@@ -3274,7 +3119,7 @@ mod tests {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let config = build_config(&codex_home).await;
         let source_thread_id = ThreadId::from_string(
-            &create_fake_rollout(
+            &create_fake_paginated_rollout(
                 codex_home.path(),
                 "2025-01-05T12-00-00",
                 "2025-01-05T12:00:00Z",
@@ -3493,12 +3338,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn side_fork_excludes_turns_without_clearing_regular_ephemeral_fork() -> Result<()> {
+    async fn side_and_regular_ephemeral_forks_exclude_unbounded_turns() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&codex_home).await;
         config.ephemeral = true;
         let thread_id = ThreadId::from_string(
-            &create_fake_rollout(
+            &create_fake_paginated_rollout(
                 codex_home.path(),
                 "2025-01-05T12-00-00",
                 "2025-01-05T12:00:00Z",
@@ -3513,15 +3358,7 @@ mod tests {
         let regular = app_server.fork_thread(config.clone(), thread_id).await?;
         let side = app_server.fork_side_thread(config, thread_id).await?;
 
-        assert_eq!(regular.turns.len(), 1);
-        assert!(matches!(
-            regular.turns[0].items.as_slice(),
-            [codex_app_server_protocol::ThreadItem::UserMessage { content, .. }]
-                if content == &[UserInput::Text {
-                    text: "Saved user message".to_string(),
-                    text_elements: Vec::new(),
-                }]
-        ));
+        assert_eq!(regular.turns, Vec::<Turn>::new());
         assert_eq!(side.turns, Vec::<Turn>::new());
         app_server.shutdown().await?;
         Ok(())

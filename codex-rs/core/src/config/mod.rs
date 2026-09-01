@@ -29,7 +29,6 @@ use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
-use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
@@ -159,6 +158,7 @@ use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
 mod auth_keyring;
+mod cch;
 pub mod edit;
 mod managed_features;
 mod network_proxy_spec;
@@ -170,8 +170,12 @@ mod requirements;
 mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
+mod thread_store;
 pub use auth_keyring::bootstrap_auth_config;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
+pub use cch::CchConfig;
+pub use cch::CchEndpointConfig;
+use cch::resolve_cch_config;
 pub use codex_agent_roles::AgentRoleConfig;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
@@ -195,6 +199,8 @@ pub use permissions::compile_permission_profile;
 pub(crate) use permissions::is_builtin_permission_profile_name;
 pub use permissions::resolve_permission_profile;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
+pub use thread_store::ThreadStoreConfig;
+use thread_store::resolve as thread_store_config;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
@@ -590,16 +596,6 @@ fn build_network_proxy_spec(
     })
 }
 
-/// Configured thread persistence backend.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ThreadStoreConfig {
-    /// Persist threads locally using rollout JSONL files and sqlite metadata.
-    #[default]
-    Local,
-    /// In-memory thread store for test and debug configurations.
-    InMemory { id: String },
-}
-
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -824,6 +820,9 @@ pub struct Config {
 
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     pub mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
+
+    /// Native CCH endpoint configuration, independent of MCP.
+    pub cch: CchConfig,
 
     /// When present, only these MCP servers omit the legacy `mcp__` namespace prefix.
     pub non_prefixed_mcp_tool_servers: Option<Vec<String>>,
@@ -2407,14 +2406,6 @@ fn resolve_tool_suggest_config_from_config(
     }
 }
 
-fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConfig {
-    match thread_store {
-        Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
-        Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
-        None => ThreadStoreConfig::Local,
-    }
-}
-
 fn is_session_layer(source: &ConfigLayerSource) -> bool {
     matches!(source, ConfigLayerSource::SessionFlags)
 }
@@ -3716,6 +3707,7 @@ impl Config {
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
+        let cch = resolve_cch_config(cfg.cch.as_ref())?;
         let history = cfg.history.unwrap_or_default();
 
         if multi_agent_v2.max_concurrent_threads_per_session == 0 {
@@ -4162,6 +4154,7 @@ impl Config {
                 ),
             },
             mcp_servers,
+            cch,
             non_prefixed_mcp_tool_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.

@@ -671,20 +671,15 @@ impl App {
                 let thread = app_server
                     .thread_read(thread_id, /*include_turns*/ false)
                     .await?;
-                let turns = match thread.history_mode {
-                    ThreadHistoryMode::Paginated if app_server.supports_paginated_history() => {
-                        app_server
-                            .thread_turns_page(thread_id, /*cursor*/ None)
-                            .await?
-                            .data
-                    }
-                    ThreadHistoryMode::Legacy | ThreadHistoryMode::Paginated => {
-                        app_server
-                            .thread_read(thread_id, /*include_turns*/ true)
-                            .await?
-                            .turns
-                    }
-                };
+                if thread.history_mode != ThreadHistoryMode::Paginated {
+                    color_eyre::eyre::bail!(
+                        "thread {thread_id} does not expose native paginated history"
+                    );
+                }
+                let turns = app_server
+                    .thread_turns_page(thread_id, /*cursor*/ None)
+                    .await?
+                    .data;
                 Ok::<_, color_eyre::Report>(
                     turns
                         .into_iter()

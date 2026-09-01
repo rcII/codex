@@ -9,6 +9,9 @@ use crate::session_start::cancel_session_start;
 use crate::session_start::complete_session_start;
 use crate::unarchive_prompt::run_unarchive_prompt;
 
+mod thread_start;
+use thread_start::spawn_startup_thread_start;
+
 async fn resolve_runtime_model_provider_base_url(provider: &ModelProviderInfo) -> Option<String> {
     let provider = create_model_provider(provider.clone(), /*auth_manager*/ None);
     match provider.runtime_base_url().await {
@@ -18,29 +21,6 @@ async fn resolve_runtime_model_provider_base_url(provider: &ModelProviderInfo) -
             None
         }
     }
-}
-
-fn spawn_startup_thread_start(
-    app_server: &AppServerSession,
-    config: Config,
-    app_event_tx: AppEventSender,
-) {
-    let request_handle = app_server.request_handle();
-    let thread_params_mode = app_server.thread_params_mode();
-    let remote_cwd_override = app_server.remote_cwd_override().map(Path::to_path_buf);
-    let thread_tool_transport = app_server.thread_tool_transport();
-    tokio::spawn(async move {
-        let result = crate::app_server_session::start_thread_with_request_handle(
-            request_handle,
-            config,
-            thread_params_mode,
-            remote_cwd_override,
-            thread_tool_transport,
-        )
-        .await
-        .map_err(|err| format!("{err:#}"));
-        app_event_tx.send(AppEvent::StartupThreadStarted { result });
-    });
 }
 
 impl App {

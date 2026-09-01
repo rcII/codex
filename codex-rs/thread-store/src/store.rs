@@ -363,6 +363,20 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    /// Flushes and projects a paginated thread, then returns its opaque rollout identity and the
+    /// inclusive durable-prefix high-water ordinal. Revert or replacement changes the identity;
+    /// append advances only the high-water ordinal.
+    fn strict_paginated_history_revision(
+        &self,
+        _thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, crate::StrictHistorySnapshot> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "strict_paginated_history_revision",
+            })
+        })
+    }
+
     /// Lists bounded ordinary and realtime thread history in rollout order.
     fn list_timeline(
         &self,

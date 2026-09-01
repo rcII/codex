@@ -19,6 +19,7 @@ use codex_config::Sourced;
 use codex_config::config_toml::AgentRoleToml;
 use codex_config::config_toml::AgentsToml;
 use codex_config::config_toml::AutoReviewToml;
+use codex_config::config_toml::CchToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ExperimentalRequestUserInput;
 use codex_config::config_toml::ProjectConfig;
@@ -123,6 +124,46 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
+
+fn cch_toml(base_url: &str, token_env: &str) -> CchToml {
+    CchToml {
+        enabled: Some(true),
+        base_url: Some(base_url.to_string()),
+        bearer_token_env_var: Some(token_env.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cch_config_is_disabled_by_default_and_resolves_bounded_loopback() {
+    assert_eq!(resolve_cch_config(None).unwrap(), CchConfig::Disabled);
+    let CchConfig::Enabled(endpoint) =
+        resolve_cch_config(Some(&cch_toml("http://localhost:7432/api", "CCH_TOKEN")))
+            .expect("valid CCH config")
+    else {
+        panic!("CCH should be enabled");
+    };
+    assert_eq!(endpoint.base_url.as_str(), "http://localhost:7432/api/");
+    assert_eq!(endpoint.timeout, Duration::from_millis(120_000));
+    assert_eq!(endpoint.max_request_body_bytes, 64 * 1024 * 1024);
+    assert_eq!(endpoint.max_response_body_bytes, 64 * 1024);
+}
+
+#[test]
+fn cch_config_rejects_unsafe_identity_and_resource_bounds() {
+    for config in [
+        cch_toml("https://example.com", "CCH_TOKEN"),
+        cch_toml("ftp://localhost", "CCH_TOKEN"),
+        cch_toml("http://localhost?token=secret", "CCH_TOKEN"),
+        cch_toml("http://localhost", "1INVALID"),
+        CchToml {
+            timeout_ms: std::num::NonZeroU64::new(99),
+            ..cch_toml("http://127.0.0.1", "CCH_TOKEN")
+        },
+    ] {
+        assert!(resolve_cch_config(Some(&config)).is_err());
+    }
+}
 
 fn stdio_mcp(command: &str) -> McpServerConfig {
     stdio_mcp_with_args(command, &[])

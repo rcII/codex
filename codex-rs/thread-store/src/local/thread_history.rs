@@ -450,11 +450,13 @@ INSERT INTO thread_items (
     rollout_ordinal,
     updated_at_ordinal,
     created_at_ms,
+    completed_at_ms,
     item_type,
     item_json
-) VALUES (?, ?, ?, ?, ?, ?, json_extract(?, '$.type'), ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, json_extract(?, '$.type'), ?)
 ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET
     updated_at_ordinal = excluded.updated_at_ordinal,
+    completed_at_ms = excluded.completed_at_ms,
     item_type = excluded.item_type,
     item_json = excluded.item_json
             "#,
@@ -465,6 +467,7 @@ ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET
         .bind(rollout_ordinal)
         .bind(rollout_ordinal)
         .bind(created_at_ms)
+        .bind(item.completed_at_ms)
         .bind(item_json.as_str())
         .bind(item_json)
         .execute(&mut **transaction)

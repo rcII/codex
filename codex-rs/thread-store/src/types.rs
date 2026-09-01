@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::strict_history::StoredThreadItem;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::CodexErrorInfo;
@@ -429,6 +430,8 @@ pub struct ListTurnsParams {
 pub struct StoredTurn {
     /// Turn id.
     pub turn_id: String,
+    /// Rollout ordinal of the terminal turn occurrence, or the start occurrence while nonterminal.
+    pub source_ordinal: u64,
     /// Projected app-server item snapshots associated with this turn, according to `items_view`.
     pub items: Vec<StoredThreadItem>,
     /// Amount of item detail included in `items`.
@@ -484,21 +487,6 @@ pub enum ItemSortKey {
     CreatedAtOrdinal,
     /// Sort by the ordinal where the item was last updated.
     UpdatedAtOrdinal,
-}
-
-/// A projected app-server `ThreadItem` snapshot within a turn.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredThreadItem {
-    /// Turn containing this item.
-    pub turn_id: String,
-    /// Stable item identifier within the turn.
-    pub item_id: String,
-    /// Rollout ordinal of the latest persisted update to this item.
-    pub updated_at_ordinal: u64,
-    /// Unix timestamp (milliseconds) when this logical item was first projected.
-    pub created_at_ms: i64,
-    /// Serialized app-server ThreadItem snapshot.
-    pub item_json: Vec<u8>,
 }
 
 /// A page of persisted items within a thread, optionally filtered to a turn.

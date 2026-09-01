@@ -3,10 +3,12 @@ mod local;
 #[cfg(target_os = "macos")]
 mod macos;
 mod project_discovery;
+mod project_local_policy;
 #[cfg(test)]
 mod tests;
 
 use self::layer_io::LoadedConfigLayers;
+use self::project_local_policy::PROJECT_LOCAL_CONFIG_DENYLIST;
 use crate::CONFIG_TOML_FILE;
 use crate::CloudConfigBundleLayers;
 use crate::ConfigLayerSource;
@@ -67,25 +69,6 @@ const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
 #[cfg(windows)]
 const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
-
-// Project-local config comes from repository contents, so it should not get to
-// choose where a user's credentials are sent or which local commands are run.
-// These settings are still supported from user, system, managed, and runtime
-// config layers.
-const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
-    "openai_base_url",
-    "chatgpt_base_url",
-    "apps_mcp_product_sku",
-    "responses_api_metadata",
-    "model_provider",
-    "model_providers",
-    "notify",
-    "profile",
-    "profiles",
-    "experimental_realtime_webrtc_call_base_url",
-    "experimental_realtime_ws_base_url",
-    "otel",
-];
 
 async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> Option<ConfigError> {
     typed_first_layer_config_error_from_entries::<ConfigToml>(layers, CONFIG_TOML_FILE).await

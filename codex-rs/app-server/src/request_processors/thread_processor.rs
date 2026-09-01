@@ -881,11 +881,29 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn strict_turns(
+        &self,
+        params: ThreadTurnsListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_turns_list_paginated_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
     pub(crate) async fn thread_items_list(
         &self,
         params: ThreadItemsListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.thread_items_list_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn strict_items(
+        &self,
+        params: ThreadItemsListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_items_list_paginated_response_inner(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -3034,7 +3052,8 @@ impl ThreadRequestProcessor {
                         sort_direction,
                         items_view,
                     )
-                    .await;
+                    .await
+                    .map(|(page, _)| page);
             }
             Ok(_) => {}
             Err(ThreadStoreError::InvalidRequest { message })
@@ -3145,280 +3164,6 @@ impl ThreadRequestProcessor {
                 })
                 .collect(),
             next_cursor: page.next_cursor,
-        })
-    }
-
-    async fn paginated_thread_turns_list_response(
-        &self,
-        thread_id: ThreadId,
-        cursor: Option<String>,
-        limit: Option<u32>,
-        sort_direction: Option<SortDirection>,
-        items_view: Option<TurnItemsView>,
-    ) -> Result<ThreadTurnsListResponse, JSONRPCErrorError> {
-        let items_view = items_view.unwrap_or(TurnItemsView::Summary);
-        let page_size = thread_turns_page_size(limit);
-        let sort_direction = match sort_direction.unwrap_or(SortDirection::Desc) {
-            SortDirection::Asc => StoreSortDirection::Asc,
-            SortDirection::Desc => StoreSortDirection::Desc,
-        };
-        // `Full` is only a temporary compatibility path. Keep it out of ThreadStore's API:
-        // load turn shells here, then hydrate their items below.
-        let stored_items_view = match items_view {
-            TurnItemsView::NotLoaded => StoredTurnItemsView::NotLoaded,
-            TurnItemsView::Summary => StoredTurnItemsView::Summary,
-            TurnItemsView::Full => StoredTurnItemsView::NotLoaded,
-        };
-        let page = self
-            .thread_store
-            .list_turns(StoreListTurnsParams {
-                thread_id,
-                include_archived: true,
-                cursor,
-                page_size,
-                sort_direction,
-                items_view: stored_items_view,
-            })
-            .await
-            .map_err(|err| match err {
-                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
-                ThreadStoreError::Unsupported { operation } => {
-                    unsupported_thread_store_operation(operation)
-                }
-                ThreadStoreError::ThreadNotFound { thread_id } => {
-                    invalid_request(format!("no rollout found for thread id {thread_id}"))
-                }
-                err => internal_error(format!("failed to list thread history: {err}")),
-            })?;
-        let mut turns = Vec::with_capacity(page.turns.len());
-        for turn in page.turns {
-            let mut turn = stored_turn_to_api_turn(turn, items_view)?;
-            if matches!(items_view, TurnItemsView::Full) {
-                turn.items = self
-                    .paginated_turn_full_items(thread_id, turn.id.as_str())
-                    .await?;
-            }
-            turns.push(turn);
-        }
-        let loaded_thread = self.thread_manager.get_thread(thread_id).await.ok();
-        let has_live_running_thread = match loaded_thread.as_ref() {
-            Some(thread) => matches!(thread.agent_status().await, AgentStatus::Running),
-            None => false,
-        };
-        normalize_thread_turns_status(
-            &mut turns,
-            self.thread_watch_manager
-                .loaded_status_for_thread(&thread_id.to_string())
-                .await,
-            has_live_running_thread,
-        );
-        Ok(ThreadTurnsListResponse {
-            data: turns,
-            next_cursor: page.next_cursor,
-            backwards_cursor: page.backwards_cursor,
-        })
-    }
-
-    // Older clients still request `itemsView: "full"` from turn pages. Keep this
-    // app-server-only hydration path until those clients use `thread/items/list`.
-    async fn paginated_turn_full_items(
-        &self,
-        thread_id: ThreadId,
-        turn_id: &str,
-    ) -> Result<Vec<ThreadItem>, JSONRPCErrorError> {
-        let mut cursor = None;
-        let mut items = Vec::new();
-        loop {
-            let page = self
-                .thread_store
-                .list_items(StoreListItemsParams {
-                    thread_id,
-                    turn_id: Some(turn_id.to_string()),
-                    include_archived: true,
-                    cursor: cursor.clone(),
-                    page_size: THREAD_ITEMS_MAX_LIMIT,
-                    sort_direction: StoreSortDirection::Asc,
-                    sort_key: StoreItemSortKey::CreatedAtOrdinal,
-                    after_updated_at_ordinal: None,
-                })
-                .await
-                .map_err(paginated_history_list_error)?;
-            for item in page.items {
-                items.push(deserialize_stored_thread_item(item)?);
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(items);
-            };
-            if cursor.as_ref() == Some(&next_cursor) {
-                return Err(internal_error(format!(
-                    "failed to load full turn items for {turn_id}: thread store returned a repeated cursor"
-                )));
-            }
-            cursor = Some(next_cursor);
-        }
-    }
-
-    // Older clients expect full `thread.turns` from resume and `thread/read(includeTurns=true)`.
-    // Keep this slow compatibility path until all clients page history directly.
-    async fn paginated_thread_full_turns(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<Vec<Turn>, JSONRPCErrorError> {
-        let mut cursor = None;
-        let mut turns = Vec::new();
-        loop {
-            let page = self
-                .paginated_thread_turns_list_response(
-                    thread_id,
-                    cursor.clone(),
-                    Some(THREAD_TURNS_MAX_LIMIT as u32),
-                    Some(SortDirection::Asc),
-                    Some(TurnItemsView::Full),
-                )
-                .await?;
-            turns.extend(page.data);
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(turns);
-            };
-            if cursor.as_ref() == Some(&next_cursor) {
-                return Err(internal_error(format!(
-                    "failed to load full thread turns for {thread_id}: thread store returned a repeated cursor"
-                )));
-            }
-            cursor = Some(next_cursor);
-        }
-    }
-
-    async fn paginated_resume_initial_turns_page(
-        &self,
-        thread_id: ThreadId,
-        params: &ThreadResumeInitialTurnsPageParams,
-    ) -> Result<codex_app_server_protocol::TurnsPage, JSONRPCErrorError> {
-        self.paginated_thread_turns_list_response(
-            thread_id,
-            /*cursor*/ None,
-            params.limit,
-            params.sort_direction,
-            params.items_view,
-        )
-        .await
-        .map(Into::into)
-    }
-
-    async fn paginated_resume_initial_turns_page_with_active_slot(
-        &self,
-        thread_id: ThreadId,
-        params: &ThreadResumeInitialTurnsPageParams,
-    ) -> Result<codex_app_server_protocol::TurnsPage, JSONRPCErrorError> {
-        // A running resume overlays the newest live turn on this durable page.
-        // Reserve one row so the overlay keeps the requested limit and the
-        // durable next cursor still starts after the last returned stored turn.
-        let page_size = thread_turns_page_size(params.limit);
-        if page_size == 1 {
-            // ThreadStore does not accept an empty page. Use its backwards cursor as
-            // the next cursor so the omitted durable row is returned next.
-            let mut page = self
-                .paginated_resume_initial_turns_page(thread_id, params)
-                .await?;
-            page.next_cursor = page.backwards_cursor.clone();
-            page.data.clear();
-            return Ok(page);
-        }
-
-        let mut params = params.clone();
-        params.limit = Some((page_size - 1) as u32);
-        self.paginated_resume_initial_turns_page(thread_id, &params)
-            .await
-    }
-
-    pub(super) async fn paginated_resume_backwards_cursors(
-        thread_store: &dyn ThreadStore,
-        thread_id: ThreadId,
-    ) -> Result<(Option<String>, Option<String>), JSONRPCErrorError> {
-        let turns_page = thread_store
-            .list_turns(StoreListTurnsParams {
-                thread_id,
-                include_archived: true,
-                cursor: None,
-                page_size: 1,
-                sort_direction: StoreSortDirection::Desc,
-                items_view: StoredTurnItemsView::NotLoaded,
-            })
-            .await
-            .map_err(paginated_history_list_error)?;
-        let items_page = thread_store
-            .list_items(StoreListItemsParams {
-                thread_id,
-                turn_id: None,
-                include_archived: true,
-                cursor: None,
-                page_size: 1,
-                sort_direction: StoreSortDirection::Desc,
-                sort_key: StoreItemSortKey::CreatedAtOrdinal,
-                after_updated_at_ordinal: None,
-            })
-            .await
-            .map_err(paginated_history_list_error)?;
-        Ok((turns_page.backwards_cursor, items_page.backwards_cursor))
-    }
-
-    async fn thread_items_list_response_inner(
-        &self,
-        params: ThreadItemsListParams,
-    ) -> Result<ThreadItemsListResponse, JSONRPCErrorError> {
-        let ThreadItemsListParams {
-            thread_id,
-            turn_id,
-            cursor,
-            limit,
-            sort_direction,
-        } = params;
-        let thread_id = ThreadId::from_string(&thread_id)
-            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
-        let page_size = limit
-            .map(|value| value as usize)
-            .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
-            .clamp(1, THREAD_ITEMS_MAX_LIMIT);
-        let page = self
-            .thread_store
-            .list_items(StoreListItemsParams {
-                thread_id,
-                turn_id,
-                include_archived: true,
-                cursor,
-                page_size,
-                sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
-                    SortDirection::Asc => StoreSortDirection::Asc,
-                    SortDirection::Desc => StoreSortDirection::Desc,
-                },
-                sort_key: StoreItemSortKey::CreatedAtOrdinal,
-                after_updated_at_ordinal: None,
-            })
-            .await
-            .map_err(|err| match err {
-                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
-                ThreadStoreError::Unsupported { .. } => {
-                    method_not_found("thread/items/list is not supported yet")
-                }
-                ThreadStoreError::ThreadNotFound { thread_id } => {
-                    invalid_request(format!("no rollout found for thread id {thread_id}"))
-                }
-                err => internal_error(format!("failed to list thread items: {err}")),
-            })?;
-        let data = page
-            .items
-            .into_iter()
-            .map(|stored_item| {
-                let turn_id = stored_item.turn_id.clone();
-                let item = deserialize_stored_thread_item(stored_item)?;
-                Ok(ThreadItemEntry { turn_id, item })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ThreadItemsListResponse {
-            data,
-            next_cursor: page.next_cursor,
-            backwards_cursor: page.backwards_cursor,
         })
     }
 
@@ -3696,9 +3441,7 @@ impl ThreadRequestProcessor {
                         "cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it",
                     )
                 })?;
-
             let cold_resume_history = paginated_resume.then(|| thread_history.get_rollout_items());
-            // Attach to the resolved child with only the caller's history-paging preferences.
             let attach_params = ThreadResumeParams {
                 thread_id: child_thread_id.to_string(),
                 exclude_turns,
@@ -4145,7 +3888,6 @@ impl ThreadRequestProcessor {
                 let is_running =
                     matches!(existing_thread.agent_status().await, AgentStatus::Running);
 
-                // Parent-owned V2 children must not be rebuilt from public resume overrides.
                 if can_accept_direct_input(
                     existing_thread.multi_agent_version(),
                     &config_snapshot.session_source,
@@ -4153,15 +3895,10 @@ impl ThreadRequestProcessor {
                     && matches!(loaded_status, ThreadStatus::Idle)
                     && !is_running
                 {
-                    // A loaded idle thread is only a cache entry. Shut it down
-                    // before removing it so cold resume cannot duplicate a
-                    // thread that timed out during shutdown.
                     match wait_for_thread_shutdown(&existing_thread).await {
                         ThreadShutdownResult::Complete => {
                             self.thread_manager.remove_thread(&existing_thread_id).await;
                             self.finalize_thread_teardown(existing_thread_id).await;
-                            // Shutdown can flush newer rollout items, so reload the
-                            // stored thread before starting the replacement session.
                             return Ok(RunningThreadResumeResult::NotRunning(None));
                         }
                         ThreadShutdownResult::SubmitFailed => {
@@ -4173,8 +3910,6 @@ impl ThreadRequestProcessor {
                     }
                 }
 
-                // Preserve rejoin semantics when another client can still observe
-                // the loaded thread or shutdown did not complete.
                 tracing::warn!(
                     "thread/resume overrides ignored for loaded thread {}: {}",
                     existing_thread_id,
@@ -4774,7 +4509,6 @@ impl ThreadRequestProcessor {
             )
         };
         let history_cwd = Some(source_thread.cwd.clone());
-
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
         if cfg!(windows) {
@@ -5345,9 +5079,9 @@ fn xcode_26_4_mcp_elicitations_auto_deny(
 }
 
 const THREAD_TURNS_DEFAULT_LIMIT: usize = 25;
-const THREAD_TURNS_MAX_LIMIT: usize = 100;
-const THREAD_ITEMS_DEFAULT_LIMIT: usize = 25;
-const THREAD_ITEMS_MAX_LIMIT: usize = 100;
+pub(super) const THREAD_TURNS_MAX_LIMIT: usize = 100;
+pub(super) const THREAD_ITEMS_DEFAULT_LIMIT: usize = 25;
+pub(super) const THREAD_ITEMS_MAX_LIMIT: usize = 100;
 const THREAD_SEARCH_OCCURRENCES_DEFAULT_LIMIT: usize = 50;
 const THREAD_SEARCH_OCCURRENCES_MAX_LIMIT: usize = 250;
 
@@ -5634,7 +5368,7 @@ fn thread_read_view_error(err: ThreadReadViewError) -> JSONRPCErrorError {
     }
 }
 
-fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
+pub(super) fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
     match err {
         ThreadStoreError::InvalidRequest { message } => invalid_request(message),
         ThreadStoreError::Unsupported { operation } => {
@@ -5645,50 +5379,6 @@ fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
         }
         err => internal_error(format!("failed to list thread history: {err}")),
     }
-}
-
-fn deserialize_stored_thread_item(
-    item: codex_thread_store::StoredThreadItem,
-) -> Result<ThreadItem, JSONRPCErrorError> {
-    serde_json::from_slice::<ThreadItem>(&item.item_json).map_err(|err| {
-        internal_error(format!(
-            "failed to deserialize stored thread item {}: {err}",
-            item.item_id
-        ))
-    })
-}
-
-fn stored_turn_to_api_turn(
-    turn: StoredTurn,
-    items_view: TurnItemsView,
-) -> Result<Turn, JSONRPCErrorError> {
-    let status = match turn.status {
-        StoredTurnStatus::Completed => TurnStatus::Completed,
-        StoredTurnStatus::Interrupted => TurnStatus::Interrupted,
-        StoredTurnStatus::Failed => TurnStatus::Failed,
-        StoredTurnStatus::InProgress => TurnStatus::InProgress,
-    };
-    let error = turn.error.map(|error| TurnError {
-        misalignment: None,
-        message: error.message,
-        codex_error_info: error.codex_error_info,
-        additional_details: error.additional_details,
-    });
-    let items = turn
-        .items
-        .into_iter()
-        .map(deserialize_stored_thread_item)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Turn {
-        id: turn.turn_id,
-        items,
-        items_view,
-        status,
-        error,
-        started_at: turn.started_at,
-        completed_at: turn.completed_at,
-        duration_ms: turn.duration_ms,
-    })
 }
 
 pub(super) fn unsupported_thread_store_operation(operation: &'static str) -> JSONRPCErrorError {

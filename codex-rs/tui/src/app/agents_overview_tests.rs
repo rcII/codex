@@ -453,7 +453,7 @@ async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
     app.enqueue_primary_thread_session(previous.session, previous.turns)
         .await?;
     let target_thread_id = ThreadId::from_string(
-        &app_test_support::create_fake_rollout(
+        &app_test_support::create_fake_paginated_rollout(
             app.config.codex_home.as_path(),
             "2025-01-05T12-00-00",
             "2025-01-05T12:00:00Z",
