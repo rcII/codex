@@ -189,6 +189,8 @@ async fn transport_enforces_request_and_response_byte_limits() {
 async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_capture() {
     let server = MockServer::start().await;
     let token = "01234567abcdefghijklmnopqrstuvwxyz=";
+    let capture_timeout = std::time::Duration::from_secs(1);
+    let operation_delay = std::time::Duration::from_millis(400);
     let (checkpoint_tx, mut checkpoint_rx) = watch::channel(0_usize);
     let (finalize_tx, mut finalize_rx) = watch::channel(0_usize);
     let last_outcome = Arc::new(StdMutex::new(None::<Json>));
@@ -196,19 +198,21 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
     Mock::given(method("POST"))
         .and(path("/v1/runtime/events"))
         .and(header("authorization", format!("Bearer {token}")))
-        .respond_with(|request: &Request| {
+        .respond_with(move |request: &Request| {
             let body: Json = request.body_json().expect("event body");
             assert_eq!(body["kind"], "thread.settings_updated");
             let key = body["idempotencyKey"].as_str().expect("idempotency key");
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "contractSha256": CONTRACT_SHA256,
-                "eventId": format!("{:x}", Sha256::digest(format!("cch:event:{key}"))),
-                "historyRevision": body["historyRevision"],
-                "idempotencyKey": key,
-                "receipt": Json::Null,
-                "sourceOrdinal": body["sourceOrdinal"],
-                "sourceSubordinal": body["sourceSubordinal"],
-            }))
+            ResponseTemplate::new(200)
+                .set_delay(operation_delay)
+                .set_body_json(serde_json::json!({
+                    "contractSha256": CONTRACT_SHA256,
+                    "eventId": format!("{:x}", Sha256::digest(format!("cch:event:{key}"))),
+                    "historyRevision": body["historyRevision"],
+                    "idempotencyKey": key,
+                    "receipt": Json::Null,
+                    "sourceOrdinal": body["sourceOrdinal"],
+                    "sourceSubordinal": body["sourceSubordinal"],
+                }))
         })
         .expect(2)
         .mount(&server)
@@ -254,7 +258,9 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
                 "threadId": body["threadId"],
             });
             *checkpoint_outcome.lock().expect("outcome lock") = Some(outcome.clone());
-            ResponseTemplate::new(200).set_body_json(outcome)
+            ResponseTemplate::new(200)
+                .set_delay(operation_delay)
+                .set_body_json(outcome)
         })
         .expect(2)
         .mount(&server)
@@ -264,13 +270,15 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
         .and(header("authorization", format!("Bearer {token}")))
         .respond_with(move |_request: &Request| {
             finalize_tx.send_modify(|count| *count += 1);
-            ResponseTemplate::new(200).set_body_json(
-                last_outcome
-                    .lock()
-                    .expect("outcome lock")
-                    .clone()
-                    .expect("checkpoint outcome"),
-            )
+            ResponseTemplate::new(200)
+                .set_delay(operation_delay)
+                .set_body_json(
+                    last_outcome
+                        .lock()
+                        .expect("outcome lock")
+                        .clone()
+                        .expect("checkpoint outcome"),
+                )
         })
         .expect(2)
         .mount(&server)
@@ -284,6 +292,7 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
         .expect("config");
     config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
     let mut endpoint = endpoint(&format!("{}/", server.uri()));
+    endpoint.timeout = capture_timeout;
     endpoint.max_request_body_bytes = 64 * 1024;
     endpoint.max_response_body_bytes = 64 * 1024;
     let integration = CchIntegration {
@@ -303,6 +312,7 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
     let thread_id = started.session.thread_id.to_string();
     let handle = app_server.request_handle();
 
+    let started_at = std::time::Instant::now();
     let first_capture = capture
         .ensure_history_captured(handle.clone(), &thread_id)
         .await;
@@ -318,6 +328,10 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
             "zero-fact Complete must release the first-turn safe boundary: {error}; {requests:?}"
         );
     }
+    assert!(
+        started_at.elapsed() > capture_timeout,
+        "healthy multi-request history capture must not inherit one whole-capture deadline"
+    );
     wait_for_count(&mut checkpoint_rx, 1).await;
     wait_for_count(&mut finalize_rx, 1).await;
     capture
@@ -339,5 +353,88 @@ async fn settings_only_empty_complete_unblocks_safe_boundary_and_terminal_captur
             .any(|path| matches!(path.as_str(), "/v1/runtime/enroll" | "/v1/runtime/recall"))
     );
     server.verify().await;
+    app_server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn exhausted_history_retry_budget_releases_all_waiters_false() {
+    let server = MockServer::start().await;
+    let token = "01234567abcdefghijklmnopqrstuvwxyz=";
+    let (event_tx, mut event_rx) = watch::channel(0_usize);
+    Mock::given(method("POST"))
+        .and(path("/v1/runtime/events"))
+        .and(header("authorization", format!("Bearer {token}")))
+        .respond_with(move |_request: &Request| {
+            event_tx.send_modify(|count| *count += 1);
+            ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(75))
+        })
+        .mount(&server)
+        .await;
+
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let mut config = crate::legacy_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config");
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+    let mut endpoint = endpoint(&format!("{}/", server.uri()));
+    endpoint.timeout = std::time::Duration::from_millis(200);
+    endpoint.max_request_body_bytes = 64 * 1024;
+    endpoint.max_response_body_bytes = 64 * 1024;
+    let integration = CchIntegration {
+        transport: CchTransport::new(endpoint, |_| Ok(token.to_string())).expect("transport"),
+        threads: Arc::new(Mutex::new(HashMap::new())),
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    let capture = integration.clone();
+    let mut app_server = crate::start_embedded_app_server_for_picker(&config)
+        .await
+        .expect("app-server");
+    app_server.install_cch_integration(Some(integration));
+    let started = app_server
+        .start_thread(&config)
+        .await
+        .expect("fresh thread");
+    let thread_id = started.session.thread_id.to_string();
+    let handle = app_server.request_handle();
+
+    let first = tokio::spawn({
+        let capture = capture.clone();
+        let handle = handle.clone();
+        let thread_id = thread_id.clone();
+        async move { capture.ensure_history_captured(handle, &thread_id).await }
+    });
+    wait_for_count(&mut event_rx, 1).await;
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("capture owner must be cancelled")
+            .is_cancelled(),
+        "the regression requires dropping the capture-owning caller"
+    );
+    let second = capture.ensure_history_captured(handle, &thread_id);
+    let second = tokio::time::timeout(std::time::Duration::from_secs(3), second)
+        .await
+        .expect("the shared capture must survive owner cancellation");
+
+    assert!(second.is_err());
+    let attempts = *event_rx.borrow();
+    assert!(
+        (4..=5).contains(&attempts),
+        "the second capture must wait on one bounded retry run, not start another: {attempts}"
+    );
+    let paths = server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        paths.iter().all(|path| path == "/v1/runtime/events"),
+        "a failed prelude must not advance to checkpoint/finalize: {paths:?}"
+    );
     app_server.shutdown().await.expect("shutdown");
 }

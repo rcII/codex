@@ -38,6 +38,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 type CchResult<T> = std::result::Result<T, CchError>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StrictHistorySnapshot {
@@ -63,6 +64,7 @@ pub(crate) struct CchHistoryThread {
     cancelled: Arc<AtomicBool>,
     ready_waiters: Vec<tokio::sync::oneshot::Sender<bool>>,
 }
+
 impl AppServerSession {
     /// Captures the server's startup migration policy before workspace config can change.
     ///
@@ -200,25 +202,14 @@ impl CchIntegration {
             let state = threads
                 .get_mut(thread_id)
                 .ok_or(CchError::HistoryExchange)?;
-            if let Some(cancelled) = request_capture(state) {
-                (Some(cancelled), None)
-            } else {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                state.ready_waiters.push(sender);
-                (None, Some(receiver))
-            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            state.ready_waiters.push(sender);
+            (request_capture(state), receiver)
         };
-        let ready = if let Some(cancelled) = cancelled {
-            self.capture_history_until_clean(app, thread_id.to_string(), cancelled)
-                .await
-        } else {
-            let ready = ready.ok_or(CchError::HistoryExchange)?;
-            matches!(
-                tokio::time::timeout(self.transport.endpoint.timeout, ready,).await,
-                Ok(Ok(true))
-            )
-        };
-        if ready {
+        if let Some(cancelled) = cancelled {
+            self.spawn_history_capture(app, thread_id.to_string(), cancelled);
+        }
+        if matches!(ready.await, Ok(true)) {
             Ok(())
         } else {
             Err(CchError::HistoryExchange)
@@ -282,60 +273,70 @@ impl CchIntegration {
         thread_id: String,
         cancelled: Arc<AtomicBool>,
     ) -> bool {
-        let capture = tokio::time::timeout(self.transport.endpoint.timeout, async {
-            let mut failures = 0;
-            loop {
-                if self.shutdown.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
-                    return false;
+        let timeout = self.transport.endpoint.timeout;
+        let mut failures = 0_u32;
+        let mut retry_delay_used = Duration::ZERO;
+        let ready = loop {
+            if self.shutdown.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+                break false;
+            }
+            let (thread, source) = {
+                let threads = self.threads.lock().await;
+                let Some(state) = threads.get(&thread_id) else {
+                    break false;
+                };
+                if !Arc::ptr_eq(&state.cancelled, &cancelled) {
+                    break false;
                 }
-                let (thread, source) = {
-                    let threads = self.threads.lock().await;
-                    let Some(state) = threads.get(&thread_id) else {
-                        return false;
+                (state.thread.clone(), state.source.clone())
+            };
+            match run_history_capture(self, &app, &thread, &source, &cancelled).await {
+                Ok(true) => {
+                    failures = 0;
+                    retry_delay_used = Duration::ZERO;
+                    let mut threads = self.threads.lock().await;
+                    let Some(state) = threads.get_mut(&thread_id) else {
+                        break false;
                     };
                     if !Arc::ptr_eq(&state.cancelled, &cancelled) {
-                        return false;
+                        break false;
                     }
-                    (state.thread.clone(), state.source.clone())
-                };
-                match run_history_capture(self, &app, &thread, &source, &cancelled).await {
-                    Ok(true) => {
-                        failures = 0;
-                        let mut threads = self.threads.lock().await;
-                        let Some(state) = threads.get_mut(&thread_id) else {
-                            return false;
-                        };
-                        if !Arc::ptr_eq(&state.cancelled, &cancelled) {
-                            return false;
-                        }
-                        if state.dirty {
-                            state.dirty = false;
-                        } else {
-                            return true;
-                        }
-                    }
-                    Ok(false) => return false,
-                    Err(error) => {
-                        failures += 1;
-                        tracing::warn!(thread_id, failures, %error, "native CCH history capture retry is bounded by the configured timeout");
-                        tokio::time::sleep(history_retry_delay(
-                            self.transport.endpoint.timeout,
-                            failures,
-                        ))
-                        .await;
+                    if state.dirty {
+                        state.dirty = false;
+                    } else {
+                        break true;
                     }
                 }
+                Ok(false) => break false,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    let delay = history_retry_delay(timeout, failures);
+                    let Some(next_retry_delay_used) = retry_delay_used
+                        .checked_add(delay)
+                        .filter(|used| *used <= timeout)
+                    else {
+                        tracing::error!(
+                            thread_id,
+                            failures,
+                            retry_budget_ms = timeout.as_millis(),
+                            retry_delay_used_ms = retry_delay_used.as_millis(),
+                            %error,
+                            "native CCH history capture exhausted its bounded retry budget"
+                        );
+                        break false;
+                    };
+                    retry_delay_used = next_retry_delay_used;
+                    tracing::warn!(
+                        thread_id,
+                        failures,
+                        retry_delay_ms = delay.as_millis(),
+                        %error,
+                        "native CCH history capture will retry after a bounded failure"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
-        })
-        .await;
-        let ready = matches!(capture, Ok(true));
-        if capture.is_err() {
-            tracing::error!(
-                thread_id,
-                timeout_ms = self.transport.endpoint.timeout.as_millis(),
-                "native CCH history capture exhausted its configured deadline"
-            );
-        }
+        };
         let mut threads = self.threads.lock().await;
         if let Some(state) = threads.get_mut(&thread_id)
             && Arc::ptr_eq(&state.cancelled, &cancelled)
@@ -634,6 +635,8 @@ async fn run_history_capture(
         prelude: &prelude,
     };
     let mut previous_request_id = 0;
+    let mut request_count = 0_u64;
+    let max_request_id = snapshot.max_history_request_id();
     loop {
         if integration.shutdown.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
             return Ok(false);
@@ -642,7 +645,7 @@ async fn run_history_capture(
         match outcome.status {
             HistoryStatus::Request => {
                 let request = outcome.request.clone().ok_or(CchError::HistoryExchange)?;
-                if request.id > snapshot.max_history_request_id() {
+                if request.id > max_request_id {
                     return Err(CchError::HistoryExchange);
                 }
                 outcome = exchange_history_page(
@@ -653,10 +656,31 @@ async fn run_history_capture(
                     &mut previous_request_id,
                 )
                 .await?;
+                request_count = request_count.saturating_add(1);
+                if request_count.is_power_of_two() {
+                    tracing::debug!(thread_id, request_count, "CCH history advanced");
+                }
             }
-            HistoryStatus::Complete | HistoryStatus::Failed => {
+            HistoryStatus::Complete => {
+                let progress = outcome.progress.clone();
+                let resource_admission = outcome.resource_admission.clone();
                 finalize_history_capture(transport, &capture, outcome).await?;
+                tracing::info!(
+                    thread_id,
+                    capture_id = capture.capture_id,
+                    request_count,
+                    source_high_water_ordinal = snapshot.source_high_water_ordinal,
+                    ?progress,
+                    ?resource_admission,
+                    "native CCH history capture completed and was acknowledged"
+                );
                 return Ok(true);
+            }
+            HistoryStatus::Failed => {
+                let cch_error = outcome.error.as_deref().unwrap_or("missing CCH error");
+                tracing::error!(thread_id, request_count, cch_error, "CCH history failed");
+                finalize_history_capture(transport, &capture, outcome).await?;
+                return Err(CchError::HistoryExchange);
             }
         }
     }
