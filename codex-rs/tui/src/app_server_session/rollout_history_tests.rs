@@ -4,12 +4,16 @@ use super::HistoryOutcome;
 use super::HistoryPrelude;
 use super::HistoryStatus;
 use super::StrictHistorySnapshot;
+use super::is_strict_turn_history_request;
 use super::verify_history_outcome;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadTurnsListParams;
+use codex_app_server_protocol::TurnItemsView;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
@@ -22,6 +26,31 @@ async fn build_config(temp_dir: &TempDir) -> Config {
         .build()
         .await
         .expect("config should build")
+}
+
+#[test]
+fn strict_turn_history_admits_only_ascending_pages_or_descending_unit_probe() {
+    let mut params = ThreadTurnsListParams {
+        thread_id: "thread-1".to_string(),
+        cursor: None,
+        limit: Some(64),
+        sort_direction: Some(SortDirection::Asc),
+        items_view: Some(TurnItemsView::NotLoaded),
+    };
+    assert!(is_strict_turn_history_request(&params));
+
+    params.sort_direction = Some(SortDirection::Desc);
+    params.limit = Some(1);
+    assert!(is_strict_turn_history_request(&params));
+
+    params.limit = Some(2);
+    assert!(!is_strict_turn_history_request(&params));
+    params.limit = Some(1);
+    params.items_view = Some(TurnItemsView::Summary);
+    assert!(!is_strict_turn_history_request(&params));
+    params.items_view = Some(TurnItemsView::NotLoaded);
+    params.sort_direction = None;
+    assert!(!is_strict_turn_history_request(&params));
 }
 
 #[tokio::test]

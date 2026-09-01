@@ -411,11 +411,9 @@ async fn execute_strict_history_request(
             if params.thread_id != capture.thread_id {
                 return Err(strict_history_error("history owner mismatch"));
             }
-            if params.sort_direction != Some(codex_app_server_protocol::SortDirection::Asc)
-                || params.items_view != Some(TurnItemsView::NotLoaded)
-            {
+            if !is_strict_turn_history_request(&params) {
                 return Err(strict_history_error(
-                    "strict turn pages require ascending source order and itemsView=notLoaded",
+                    "strict turn history requires ascending pages or a descending unit probe and itemsView=notLoaded",
                 ));
             }
             serialize_strict_history_response(
@@ -461,6 +459,16 @@ async fn execute_strict_history_request(
     }?;
     validate_strict_page_response(&response, capture.snapshot)?;
     Ok(response)
+}
+fn is_strict_turn_history_request(params: &ThreadTurnsListParams) -> bool {
+    if params.items_view != Some(TurnItemsView::NotLoaded) {
+        return false;
+    }
+    match params.sort_direction {
+        Some(codex_app_server_protocol::SortDirection::Asc) => true,
+        Some(codex_app_server_protocol::SortDirection::Desc) => params.limit == Some(1),
+        None => false,
+    }
 }
 fn validate_strict_page_response(
     response: &Value,
